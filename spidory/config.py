@@ -19,6 +19,8 @@ class ModelConfig:
     target_mean: float = 2.5
     prefix: int = 32
     use_experts: bool = True
+    between_layers: int = 0  # layers of the between block that runs between centre runs; 0 = none
+    between_mode: str = "shared"  # "shared": one block for every gap; "per_gap": one block per gap
     active_experts: int = 1  # experts applied per sequence, weighted by the router
     arch: str = "ngpt"  # "ngpt": Dory-style normalized blocks, SwiGLU, RoPE; "prenorm": the v1-v2 blocks
     run_mode: str = "table"  # "table": run counts from targets; "joint": the run neuron picks them

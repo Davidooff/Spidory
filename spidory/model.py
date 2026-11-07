@@ -95,6 +95,10 @@ class Spidory(nn.Module):
         self.input_block = nn.ModuleList(layer() for _ in range(cfg.n_input))
         self.core = nn.ModuleList(layer() for _ in range(cfg.n_core))
         self.output_block = nn.ModuleList(layer() for _ in range(cfg.n_output))
+        if cfg.between_layers > 0:
+            gaps = 1 if cfg.between_mode == "shared" else cfg.max_runs - 1
+            self.between = nn.ModuleList(nn.ModuleList(layer() for _ in range(cfg.between_layers))
+                                         for _ in range(gaps))
         # Shared layers initialise first, so with one seed Plain and expert models start equal.
         self.apply(self._init)
         groups = 1
@@ -182,6 +186,32 @@ class Spidory(nn.Module):
             return (h @ self.tok.weight.T) * self.s_z()
         return self.norm(h) @ self.tok.weight.T
 
+    @property
+    def has_between(self) -> bool:
+        return self.cfg.between_layers > 0
+
+    def _between(self, s: torch.Tensor, gap: int) -> torch.Tensor:
+        """The between block after centre run `gap` (counting from 1)."""
+        blocks = self.between[0 if self.cfg.between_mode == "shared" else gap - 1]
+        for block in blocks:
+            s = block(s)
+        return self._unit(s)
+
+    def _enter_last(self, raw: torch.Tensor, ks: torch.Tensor) -> torch.Tensor:
+        """State entering each sequence's last centre run.
+
+        raw is the state after run k-1. The between block for gap k-1 runs here with gradients,
+        so between blocks learn: in per-gap mode, gap g learns when k = g + 1.
+        """
+        if not self.has_between or not (ks > 1).any():
+            return raw
+        start = raw.clone()
+        for k in ks.unique().tolist():
+            if k >= 2:
+                rows = (ks == k).nonzero().squeeze(1)
+                start[rows] = self._between(raw[rows], k - 1)
+        return start
+
     def _loop_tokens(self, x, gates, ks: torch.Tensor) -> torch.Tensor:
         """Per-token run counts: ks is (batch, tokens).
 
@@ -189,15 +219,19 @@ class Spidory(nn.Module):
         that has finished keeps its state, so later tokens can still read it. Each token learns
         from its own last run only (TBPTL depth 1 per token): run inputs are detached.
         """
+        grad = torch.is_grad_enabled()
+        top = int(ks.max())
         state, out = x, x
-        for run in range(1, int(ks.max()) + 1):
-            if torch.is_grad_enabled():
-                new = self._run_once(state.detach(), x, gates)
-            else:
-                new = self._run_once(state, x, gates)
-            active = (ks >= run)[:, :, None]
+        for run in range(1, top + 1):
+            # With a between block, the run input keeps the gradient of the block just before it.
+            entering = state if (self.has_between and run > 1) or not grad else state.detach()
+            new = self._run_once(entering, x, gates)
             out = torch.where((ks == run)[:, :, None], new, out)
-            state = torch.where(active, new.detach() if torch.is_grad_enabled() else new, state)
+            kept = new.detach() if grad else new
+            state = torch.where((ks >= run)[:, :, None], kept, state.detach() if grad else state)
+            if self.has_between and run < top:
+                moved = self._between(state, run)
+                state = torch.where((ks > run)[:, :, None], moved, state)
         return out
 
     def _loop(self, x, gates, ks: torch.Tensor) -> torch.Tensor:
@@ -211,7 +245,12 @@ class Spidory(nn.Module):
                 rows = (ks > run).nonzero().squeeze(1)
                 sub_gates = None if gates is None else gates[rows]
                 state[rows] = self._run_once(state[rows], x[rows], sub_gates)
-        return self._run_once(state, x, gates)
+                if self.has_between:
+                    # The between block before each last run is applied later, with gradients.
+                    later = (ks > run + 1).nonzero().squeeze(1)
+                    if len(later):
+                        state[later] = self._between(state[later], run)
+        return self._run_once(self._enter_last(state, ks), x, gates)
 
     def forward(self, tokens: torch.Tensor, ks=1, tau: float = 1.0, experts_on: bool = True,
                 gate_override: torch.Tensor | None = None) -> dict:
@@ -313,8 +352,10 @@ class Spidory(nn.Module):
                 gates = None if expert < 0 else all_gates[rows]
                 x = self._unit(h0[rows])
                 h = x
-                for _ in range(count):
+                for run in range(1, count + 1):
                     h = self._run_once(h, x, gates)
+                    if self.has_between and run < count:
+                        h = self._between(h, run)
                 logits[rows] = self._decode(h, ks[rows], experts[rows]).to(logits.dtype)
         self.train(was_training)
         return logits, experts, ks

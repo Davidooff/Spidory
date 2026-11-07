@@ -34,7 +34,8 @@ def tflops_by_k(cfg) -> dict[int, float]:
     per_run = cfg.n_core * block
     if cfg.use_experts:
         per_run += (3 if ngpt else 2) * d * cfg.expert_dim * t
-    return {k: 2 * (fixed + k * per_run) / t / TERA for k in range(1, cfg.max_runs + 1)}
+    between = getattr(cfg, "between_layers", 0) * block  # runs between centre runs: k - 1 times
+    return {k: 2 * (fixed + k * per_run + (k - 1) * between) / t / TERA for k in range(1, cfg.max_runs + 1)}
 
 
 def average_tflops(table: dict[int, float], run_counts: list[int]) -> float:

@@ -185,6 +185,8 @@ def main() -> None:
     parser.add_argument("--expert-dim", type=int, default=ModelConfig.expert_dim)
     parser.add_argument("--arch", choices=["ngpt", "prenorm"], default=ModelConfig.arch)
     parser.add_argument("--active-experts", type=int, default=ModelConfig.active_experts)
+    parser.add_argument("--between-layers", type=int, default=ModelConfig.between_layers)
+    parser.add_argument("--between-mode", choices=["shared", "per_gap"], default=ModelConfig.between_mode)
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
     parser.add_argument("--warmup", type=int, default=TrainConfig.warmup_lr_steps)
     parser.add_argument("--seed", type=int, default=0)
@@ -213,7 +215,8 @@ def main() -> None:
                           warmup_lr_steps=args.warmup)
         model = Spidory(ModelConfig(seq_len=args.seq_len, use_experts=not args.plain, d_model=args.d_model,
                                     expert_dim=args.expert_dim, arch=args.arch,
-                                    active_experts=args.active_experts)).to(device)
+                                    active_experts=args.active_experts, between_layers=args.between_layers,
+                                    between_mode=args.between_mode)).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
     if start >= stop:
