@@ -24,6 +24,7 @@ class ModelConfig:
     between_merge: bool = False  # the between block merges the input back in, learned, instead of N(s + x)
     boundary_norm: bool = True  # normalize at loop boundaries; with nGPT, layers still normalize inside
     active_experts: int = 1  # experts applied per sequence, weighted by the router
+    route_per_loop: bool = False  # the router picks again before each run, from the current state
     arch: str = "ngpt"  # "ngpt": Dory-style normalized blocks, SwiGLU, RoPE; "prenorm": the v1-v2 blocks
     run_mode: str = "table"  # "table": run counts from targets; "joint": the run neuron picks them
     neuron: str = "net"  # "net": small network; "linear": one neuron per run count, per expert
@@ -42,7 +43,8 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     warmup_lr_steps: int = 200
-    balance_penalty: float = 0.2
+    balance_penalty: float = 0.05  # Switch-style: balances where sequences go
+    router_sharpen: float = 0.05  # lowers each input's routing uncertainty, so the router decides
     tau_start: float = 1.0
     tau_end: float = 0.3
     one_run_share: float = 0.1  # stage 2 batches forced to one run

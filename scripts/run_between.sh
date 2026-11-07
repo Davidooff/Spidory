@@ -6,8 +6,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=. OMP_NUM_THREADS=4
 PY=${PY:-/venv/main/bin/python}
-S1=24000; S2=24000; CYCLE=6000; ROUND=2400; PASSES=2; BATCH=64; SEED=${1:-0}; LAYERS=6
-TOTAL=$((S1 + S2 + CYCLE + ROUND * 4 * PASSES))
+S1=24000; S2=24000; CYCLE=6000; ROUND=3200; PASSES=2; BATCH=64; SEED=${1:-0}; LAYERS=6
+TOTAL=$((S1 + S2 + CYCLE + ROUND * 3 * PASSES))
 COMMON="--stage1 $S1 --stage2 $S2 --cycle $CYCLE --total $TOTAL --batch-size $BATCH --seed $SEED --arch ngpt --lr 6e-3 --warmup 1000 --between-layers $LAYERS"
 R="--round-steps $ROUND --passes $PASSES --seed $SEED"
 fail() { echo "$1" > runs/STOPPED; exit 1; }

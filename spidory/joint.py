@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .model import balance_penalty, run_penalty
+from .model import routing_losses, run_penalty
 
 
 def neuron_objective(probs: torch.Tensor, losses: torch.Tensor) -> torch.Tensor:
@@ -38,6 +38,8 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
     rows = torch.arange(size, device=device)
     h0, pooled = model._encode(inputs)
     x = model._unit(h0)
+    model._route_tau = tau
+    model._loop_router_logits = []
     router_logits = model.router(pooled)
     gates = model.route(router_logits, tau, True)
     experts = gates.argmax(-1)
@@ -48,7 +50,7 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
     with torch.no_grad():
         state = x.detach()
         for run in range(1, runs + 1):
-            state = model._run_once(state, x.detach(), gates.detach())
+            state = model._run_once(state, x.detach(), gates.detach(), run)
             states.append(state)  # state after this run, before any between block
             if model.has_between and run < runs:
                 state = model._between(state, run, x.detach())
@@ -63,7 +65,7 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
         return torch.where((ks == 1)[:, None, None], x, model._enter_last(before, ks, x))
 
     def last_run(ks):
-        return model._run_once(start_of(ks), x, gates)
+        return model._run_once(start_of(ks), x, gates, ks)
 
     with torch.no_grad():
         sampled = torch.multinomial(probs, 1).squeeze(1) + 1
@@ -92,9 +94,11 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
         loss = loss + tcfg.neuron_weight * neuron
         parts["neuron"] = neuron.item()
     penalty = run_penalty(probs, gates, model.run_targets)
-    balance = balance_penalty(router_logits)
-    loss = loss + tcfg.run_penalty * penalty + tcfg.balance_penalty * balance
+    routing, routing_parts = routing_losses(router_logits, gates, model._loop_router_logits, tcfg)
+    model._loop_router_logits = None
+    loss = loss + tcfg.run_penalty * penalty + routing
     counts = torch.arange(1, runs + 1, device=device, dtype=probs.dtype)
-    parts.update(run=penalty.item(), balance=balance.item(),
+    parts.update(routing_parts)
+    parts.update(run=penalty.item(),
                  mean_runs=float((probs.detach() * counts).sum(1).mean()))
     return loss, parts

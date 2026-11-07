@@ -164,11 +164,32 @@ class Spidory(nn.Module):
         """Dory's per-token L2 normalization: unit length with nGPT, sqrt(d) for the old blocks."""
         return F.normalize(h, dim=-1, eps=1e-6) * (1.0 if self.ngpt else self.cfg.d_model ** 0.5)
 
-    def _run_once(self, s, x, gates):
+    _route_tau = 0.3  # set per step in training
+    _loop_router_logits: list | None = None  # per-loop routing with gradients, for the routing losses
+    _route_record: list | None = None  # when a list, each run's chosen experts are appended
+
+    def _route_from_state(self, s: torch.Tensor, gates: torch.Tensor, run) -> torch.Tensor:
+        """With route_per_loop, runs after the first pick experts from the state entering them."""
+        later = torch.as_tensor(run, device=s.device)
+        later = (later > 1).expand(len(s)) if later.dim() == 0 else later > 1
+        if not later.any():
+            return gates
+        logits = self.router(s[:, : self.cfg.prefix].mean(dim=1))
+        routed = self.route(logits, self._route_tau if self.training else self.route_tau, self.training)
+        if self.training and torch.is_grad_enabled() and self._loop_router_logits is not None:
+            self._loop_router_logits.append((logits[later], routed[later]))
+        return torch.where(later[:, None], routed.to(gates.dtype), gates)
+
+    def _run_once(self, s, x, gates, run=1):
         """Dory's loop: u = N(s + x), then s = N(F(u)). Experts join inside F.
 
         With a merging between block, the input was already merged in, so u = s.
+        `run` (an int, or one value per row) counts from 1; per-loop routing uses it.
         """
+        if gates is not None and self.cfg.route_per_loop:
+            gates = self._route_from_state(s, gates, run)
+        if gates is not None and self._route_record is not None:
+            self._route_record.append(gates.argmax(-1).detach().cpu())
         merged = self.cfg.between_merge
         h = s if merged else s + x
         if self.cfg.boundary_norm:
@@ -247,7 +268,7 @@ class Spidory(nn.Module):
         for run in range(1, top + 1):
             # With a between block, the run input keeps the gradient of the block just before it.
             entering = state if (self.has_between and run > 1) or not grad else state.detach()
-            new = self._run_once(entering, x, gates)
+            new = self._run_once(entering, x, gates, run)
             out = torch.where((ks == run)[:, :, None], new, out)
             kept = new.detach() if grad else new
             state = torch.where((ks >= run)[:, :, None], kept, state.detach() if grad else state)
@@ -266,13 +287,13 @@ class Spidory(nn.Module):
             for run in range(1, int(ks.max())):
                 rows = (ks > run).nonzero().squeeze(1)
                 sub_gates = None if gates is None else gates[rows]
-                state[rows] = self._run_once(state[rows], x[rows], sub_gates)
+                state[rows] = self._run_once(state[rows], x[rows], sub_gates, run)
                 if self.has_between:
                     # The between block before each last run is applied later, with gradients.
                     later = (ks > run + 1).nonzero().squeeze(1)
                     if len(later):
                         state[later] = self._between(state[later], run, x[later])
-        return self._run_once(self._enter_last(state, ks, x), x, gates)
+        return self._run_once(self._enter_last(state, ks, x), x, gates, ks)
 
     def forward(self, tokens: torch.Tensor, ks=1, tau: float = 1.0, experts_on: bool = True,
                 gate_override: torch.Tensor | None = None) -> dict:
@@ -281,6 +302,8 @@ class Spidory(nn.Module):
         size, device = tokens.size(0), tokens.device
         h0, pooled = self._encode(tokens)
         router_logits, gates = None, gate_override
+        self._route_tau = tau
+        self._loop_router_logits = [] if self.training else None
         if cfg.use_experts and experts_on and gate_override is None:
             router_logits = self.router(pooled)
             gates = self.route(router_logits, tau if self.training else self.route_tau, self.training).to(h0.dtype)
@@ -291,7 +314,9 @@ class Spidory(nn.Module):
             ks = torch.full((size,), ks, device=device)
         loop = self._loop_tokens if ks.dim() == 2 else self._loop
         h = loop(self._unit(h0), gates, ks)
-        return {"logits": self._decode(h, ks, chosen), "gates": gates, "router_logits": router_logits, "ks": ks}
+        loop_routing, self._loop_router_logits = self._loop_router_logits or [], None
+        return {"logits": self._decode(h, ks, chosen), "gates": gates, "router_logits": router_logits, "ks": ks,
+                "loop_routing": loop_routing}
 
     route_tau = 0.3  # routing temperature at test time: where training's sharpening ends
 
@@ -382,7 +407,7 @@ class Spidory(nn.Module):
                 h = x
                 states = []
                 for run in range(1, count + 1):
-                    h = self._run_once(h, x, gates)
+                    h = self._run_once(h, x, gates, run)
                     states.append(h)  # after the centre run, before any between block, as in training
                     if self.has_between and run < count:
                         h = self._between(h, run, x)
@@ -424,19 +449,42 @@ def run_penalty(run_probs: torch.Tensor, gates: torch.Tensor, targets: torch.Ten
     return (share * (means - targets.to(means.dtype)) ** 2).sum()
 
 
-def balance_penalty(router_logits: torch.Tensor) -> torch.Tensor:
-    """KL from average routing to an even share, so one expert cannot take everything."""
-    usage = F.softmax(router_logits, -1).mean(0)
-    return (usage * (usage.clamp(min=1e-9).log() + math.log(usage.numel()))).sum()
+def balance_penalty(router_logits: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
+    """Switch Transformer load balancing: experts x sum(share of sequences sent x mean probability).
+
+    Lowest (1.0) when sequences are spread evenly. The earlier loss balanced mean probabilities,
+    which a router satisfies by giving every expert 25% on every input: it stopped deciding, and
+    every sequence went to one expert. This one balances where sequences actually go.
+    """
+    probs = F.softmax(router_logits.float(), -1)
+    chosen = (gates.detach() > 0).float()
+    share = chosen.mean(0) / chosen.sum(-1).mean().clamp(min=1.0)
+    return probs.size(-1) * (share * probs.mean(0)).sum()
 
 
-def compute_loss(out: dict, targets: torch.Tensor, balance_weight: float):
+def routing_uncertainty(router_logits: torch.Tensor) -> torch.Tensor:
+    """Mean routing entropy per input, from 0 (decided) to 1 (every expert equal)."""
+    probs = F.softmax(router_logits.float(), -1)
+    entropy = -(probs * probs.clamp(min=1e-9).log()).sum(-1)
+    return entropy.mean() / math.log(probs.size(-1))
+
+
+def routing_losses(router_logits, gates, loop_routing, cfg) -> tuple[torch.Tensor, dict]:
+    """Balance and sharpening, over the first routing and every per-loop routing."""
+    pairs = [(router_logits, gates)] + list(loop_routing or [])
+    balance = sum(balance_penalty(l, g) for l, g in pairs) / len(pairs)
+    sharpen = sum(routing_uncertainty(l) for l, _ in pairs) / len(pairs)
+    loss = cfg.balance_penalty * balance + cfg.router_sharpen * sharpen
+    return loss, {"balance": balance.item(), "router_uncertainty": sharpen.item()}
+
+
+def compute_loss(out: dict, targets: torch.Tensor, cfg):
     """Takes model output and tokens only: there is no dataset argument by design."""
     ce = F.cross_entropy(out["logits"].flatten(0, 1).float(), targets.flatten())
     parts = {"ce": ce.item()}
     loss = ce
     if out["router_logits"] is not None:
-        penalty = balance_penalty(out["router_logits"])
-        parts["balance"] = penalty.item()
-        loss = loss + balance_weight * penalty
+        routing, found = routing_losses(out["router_logits"], out["gates"], out.get("loop_routing"), cfg)
+        parts.update(found)
+        loss = loss + routing
     return loss, parts
