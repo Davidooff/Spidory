@@ -41,3 +41,11 @@ def test_clean_rewrites_files_and_reports(tmp_path):
         assert report[name]["dropped_documents"] == 1
         kept = np.fromfile(tmp_path / f"{name}.train.bin", dtype=np.uint16)
         assert 30 not in kept.tolist() and 60 in kept.tolist()
+
+
+def test_a_window_crossing_a_document_end_is_ignored():
+    held = clean_v5.held_hashes([np.array([40, 41, EOD, 42, 43], dtype=np.uint16)], 4, EOD)
+    assert len(held) == 0  # every 4-token window of that stream crosses its document end
+    held = clean_v5.held_hashes([np.array([60, 61, 62, 63], dtype=np.uint16)], 4, EOD)
+    train = stream([5, 6, 60], [61, 62, 63, 9])  # the text is split across two documents
+    assert len(clean_v5.leaking_documents(train, held, 4, EOD)) == 0

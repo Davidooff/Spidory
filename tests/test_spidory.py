@@ -518,7 +518,21 @@ def test_policy_test_picks_fixed_counts_on_validation(corpus):
     found = policy_test(model, corpus, 4)
     assert found["best_fixed_k"] in (1, 2, 3, 4)
     assert set(found["per_dataset_k"]) == set(DATASETS)
-    assert {"difference", "ci_low", "ci_high", "ours_better"} <= set(found["vs_per_dataset"])
+    assert {"difference", "ci_low", "ci_high", "ours_better", "at_no_more_compute"} <= set(found["vs_per_dataset"])
+    assert found["tflops"]["learned"] > 0 and found["tflops"]["best_fixed"] > 0
+
+
+def test_rounds_judge_neuron_models_with_the_neuron(corpus, monkeypatch):
+    seen = []
+    import spidory.rounds as rounds_module
+    original = rounds_module.heldout_loss
+    monkeypatch.setattr(rounds_module, "heldout_loss", lambda *a, **kw: (seen.append(kw.get("learned")), original(*a, **kw))[1])
+    model = Spidory(replace(CFG, run_mode="joint"))
+    model.run_head_ready.fill_(True)
+    cfg = replace(TCFG, eval_windows=4, batch_size=2)
+    rounds_module.run_rounds(model, make_optimizer(model, cfg), corpus, cfg, replace(RoundConfig(), passes=1, steps=1),
+                             8, 0, True, lambda _: None)
+    assert seen and all(seen)
 
 
 def test_plain_is_a_bit_smaller():

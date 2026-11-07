@@ -81,12 +81,14 @@ Splits are leak-free by a hash of the expression.
 
 **Held-out sets:** story, code and QA val/test are the same from v1 onwards (SQuAD validation
 for QA), so scores compare across versions. Maths held-out sets changed when the task changed.
-Article titles in SQuAD's held-out sets were excluded from Wikipedia and HotpotQA training.
+Article titles in SQuAD's held-out sets were meant to be excluded from Wikipedia and HotpotQA
+training, but the filter missed 33 of 48 titles (underscores vs spaces), and Natural Questions was
+not filtered. Data v5 fixes this (section 8).
 
 ## 5. Every trained model and its result
 | Run | Model | Data | Steps | Machine | Result |
 |---|---|---|---:|---|---|
-| v1.1 | Plain 4.1M, old pre-norm blocks | v1 | 65,000 | Vast Texas/Oregon | Early check failed: loops +0.21% loss. Maths accuracy 2.7% at every `k`. |
+| v1.1 | Plain 3.95M, old pre-norm blocks | v1 | 65,000 | Vast Texas/Oregon | Early check failed: loops +0.21% loss. Maths accuracy 2.7% at every `k`. |
 | v2 | Plain 23.6M, 4/10/4 layers, width 320 | v1 easy maths | 60,000 | Vast Vietnam | Early check failed: -0.54% loss, +1.2 maths points. QA overfit (held-out loss 5.27). |
 | v2-100M | Experts 102.4M, width 672, 4 experts | v1 + grown story and code | 128,000 | Vast Pennsylvania | Finished. Post-hoc run neuron beat every fixed `k`. |
 | v3 attempt 1 | Plain 23.6M | v2 | 48,000 | Vast Poland | Early check failed narrowly. Every dataset gained at `k = 2`, but none by 1%. |
@@ -158,14 +160,21 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
 | Two experts | 131 / 137 | 7.8 GB |
 
 ## 6. What the results say so far
-- **Loops help only a little:** about 0.4-0.9% at 2 runs. They never helped at 3-4 runs.
-- **Datasets want different run counts:** story and code prefer 2 runs, while maths loss and QA
-  prefer 1. This pattern repeated across model sizes and datasets, and it's the basis of the
-  per-expert run idea.
-- **A neuron choosing per input beats a fixed count** in the one test so far (100M, one seed):
-  0.5% lower loss than `k = 2`, at 15% less compute. Not yet confirmed with a second seed or the
-  user's own neuron design.
-- **Experts specialise without labels:** clearly for maths, more weakly for the other datasets.
+- **Loops help only a little:** about 0.4-0.9% at 24M, and up to 1.35% (story) and 1.04% (code)
+  at 100M, where story and code were best at 3 runs. That costs about 1.5 times the compute at
+  2 runs, and no compute-matched model without loops has been trained to compare against.
+- **Datasets sometimes want different run counts:** at 100M and in v2, story and code preferred
+  more runs while maths and QA preferred 1. This did **not** repeat in v3 attempt 1, where every
+  dataset was best at 2 runs. The 1-run preference appeared only where QA was overfit or maths was
+  near 99%, so it's weak evidence.
+- **The neuron's advantage is not established** (100M, one seed, a post-hoc neuron, not the user's
+  design). Against the best fixed count (`k = 1`), it gained only 0.17%, using 32% more compute.
+  A fixed count chosen per dataset scored 2.852, **better** than the neuron's 2.857, so there's no
+  sign yet that choosing per input beats choosing per dataset. The earlier "0.5% lower than
+  `k = 2`" compared against a weaker baseline.
+- **Experts specialised without labels in the 100M run** (old pre-norm blocks): clearly for maths,
+  more weakly for the other datasets. In nGPT models, experts never switched on until the fix in
+  section 8, so no nGPT expert result exists yet.
 - **Data quality mattered more than size:** easier maths took accuracy from 2.7% to 99%, and
   harder levels brought it to a useful 67%. More QA data fixed overfitting (held-out loss 5.3
   to 3.0).
@@ -259,11 +268,41 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
 35. **A safety-filter interruption** cut off one reply mid-run, and work continued from the last
     result.
 
+### Found by an independent review (after the full runs started)
+36. **nGPT experts could never switch on (my bug).** The expert step size used a learned scale
+    with `init = 0`, so its learning ratio was 0: experts got no gradient, and the router learned
+    only from the balance penalty. My tests missed it, because their helper set a value with no
+    effect. All three runs were stopped. Fixed with a regression test that needs no help.
+37. **QA held-out leak:** SQuAD's held-out titles use underscores, Wikipedia's use spaces, so the
+    title filter missed 33 of 48; Natural Questions was not filtered at all. Data v5 drops any
+    training document sharing a 16-token passage (24 for story) with val or test.
+38. **A weak success rule:** the neuron was compared with a blend of two run counts. It's now
+    compared with the best fixed count and the best count per dataset, both picked on validation
+    data, using a 95% paired bootstrap interval on test data.
+39. **The mix variant was tested differently than it trained.** It's now tested with the same
+    mix of run states, and counts the compute of all runs.
+40. **Two active experts used a different routing temperature at test** (1.0 vs about 0.3). Fixed.
+41. **Batch pieces changed the penalties for some variants only.** Every model now uses the same
+    pieces from stage 2b on.
+42. **The early check stopped the neuron experiments,** with a noisy +2-point bar. It's now
+    recorded only.
+43. **This log overstated results.** Corrected in sections 5 and 6: the v1.1 size, "never helped
+    at 3-4 runs", the dataset pattern, and the neuron's advantage. The v1.1 per-dataset table and
+    its 2.7% maths accuracy came from a laptop evaluation that wasn't saved to a file.
+
+Still open, from the review:
+- Single seeds so far.
+- No compute-matched model without loops.
+- Between-block versions not matched in parameters or compute.
+- The penalty may hold every expert's average near 2.5.
+- QA held-out windows repeat each SQuAD paragraph about 5 times.
+
 ## 9. Costs
 - **Before the current runs:** about $6.40 of Vast credit, across 11 rentals, including several
   replaced within minutes.
-- **Current runs:** 3 RTX 4090s at about $1.35 per hour for about 16-19 hours, so about $24
-  expected.
+- **Current runs:** 3 RTX 4090s at about $1.35 per hour. The first start (about 1.5 hours) was
+  stopped after the review found the expert bug. The clean restart is expected to take about
+  16-19 hours, so about $24.
 - **Budget:** the original $10 limit was removed by the user on 2026-11-07.
 
 ## 10. Where things are

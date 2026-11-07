@@ -5,6 +5,10 @@ for each dataset, every n-token window of its val and test streams is hashed, an
 document (documents end with [EOD]) containing one of those windows is removed. Story uses
 24-token windows, because short phrases repeat across children's stories; QA and code use 16.
 Maths is already split by question, so it is left as it is.
+
+Windows that cross a document end are ignored, so a match always belongs to the document that
+contains it. A review found that most matches are generic text (story openings, common code
+lines), not real leaks; that filtering applies equally to every model.
 """
 from __future__ import annotations
 
@@ -34,8 +38,16 @@ def ngram_hashes(ids: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def held_hashes(streams: list[np.ndarray], n: int) -> np.ndarray:
-    return np.unique(np.concatenate([ngram_hashes(s, n) for s in streams]))
+def within_documents(ids: np.ndarray, n: int, eod: int = 1) -> np.ndarray:
+    """True for each window of n tokens that contains no document end, so stays in one document."""
+    if len(ids) < n:
+        return np.zeros(0, dtype=bool)
+    ends = np.concatenate([[0], np.cumsum(ids == eod)])
+    return (ends[n:] - ends[:-n]) == 0
+
+
+def held_hashes(streams: list[np.ndarray], n: int, eod: int = 1) -> np.ndarray:
+    return np.unique(np.concatenate([ngram_hashes(s, n)[within_documents(s, n, eod)] for s in streams]))
 
 
 def leaking_documents(train: np.ndarray, held: np.ndarray, n: int, eod: int, chunk: int = 20_000_000) -> np.ndarray:
@@ -44,7 +56,7 @@ def leaking_documents(train: np.ndarray, held: np.ndarray, n: int, eod: int, chu
     bad = []
     for start in range(0, len(train), chunk):
         piece = train[start:start + chunk + n - 1]
-        hit = np.isin(ngram_hashes(piece, n), held)
+        hit = np.isin(ngram_hashes(piece, n), held) & within_documents(piece, n, eod)
         if hit.any():
             bad.append(np.unique(doc_of[start + np.nonzero(hit)[0]]))
     return np.unique(np.concatenate(bad)) if bad else np.zeros(0, dtype=np.int64)
@@ -59,7 +71,7 @@ def clean(root: Path, eod: int) -> dict:
     report = {}
     for name, n in WINDOWS.items():
         train = np.fromfile(root / f"{name}.train.bin", dtype=np.uint16)
-        held = held_hashes([np.fromfile(root / f"{name}.{s}.bin", dtype=np.uint16) for s in ("val", "test")], n)
+        held = held_hashes([np.fromfile(root / f"{name}.{s}.bin", dtype=np.uint16) for s in ("val", "test")], n, eod)
         bad = leaking_documents(train, held, n, eod)
         kept = drop_documents(train, bad, eod)
         documents = int((train == eod).sum())

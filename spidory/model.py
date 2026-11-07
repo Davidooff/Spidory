@@ -283,7 +283,7 @@ class Spidory(nn.Module):
         router_logits, gates = None, gate_override
         if cfg.use_experts and experts_on and gate_override is None:
             router_logits = self.router(pooled)
-            gates = self.route(router_logits, tau, self.training).to(h0.dtype)
+            gates = self.route(router_logits, tau if self.training else self.route_tau, self.training).to(h0.dtype)
         chosen = gates.argmax(-1) if gates is not None else torch.full((size,), -1, device=device)
         if callable(ks):
             ks = ks(chosen)
