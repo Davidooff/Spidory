@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig
+from .ngpt import NBlock, NExpert, Scale, normalize_weights, unit
 
 
 def amp(device: torch.device):
@@ -83,28 +84,38 @@ class Spidory(nn.Module):
         super().__init__()
         self.cfg = cfg
         d = cfg.d_model
+        self.ngpt = cfg.arch == "ngpt"
+        layer = (lambda: NBlock(d, cfg.n_heads)) if self.ngpt else (lambda: Block(d, cfg.n_heads))
         self.tok = nn.Embedding(cfg.vocab_size, d)
-        self.pos = nn.Embedding(cfg.seq_len, d)
-        self.input_block = nn.ModuleList(Block(d, cfg.n_heads) for _ in range(cfg.n_input))
-        self.core = nn.ModuleList(Block(d, cfg.n_heads) for _ in range(cfg.n_core))
-        self.output_block = nn.ModuleList(Block(d, cfg.n_heads) for _ in range(cfg.n_output))
-        self.norm = nn.LayerNorm(d)
+        if self.ngpt:
+            self.s_z = Scale(cfg.vocab_size, 1.0, 1 / math.sqrt(d))  # RoPE replaces positions
+        else:
+            self.pos = nn.Embedding(cfg.seq_len, d)
+            self.norm = nn.LayerNorm(d)
+        self.input_block = nn.ModuleList(layer() for _ in range(cfg.n_input))
+        self.core = nn.ModuleList(layer() for _ in range(cfg.n_core))
+        self.output_block = nn.ModuleList(layer() for _ in range(cfg.n_output))
         # Shared layers initialise first, so with one seed Plain and expert models start equal.
         self.apply(self._init)
         groups = 1
         if cfg.use_experts:
             groups = cfg.n_experts
-            self.experts = nn.ModuleList(Expert(d, cfg.expert_dim) for _ in range(groups))
+            expert = (lambda: NExpert(d, cfg.expert_dim)) if self.ngpt else (lambda: Expert(d, cfg.expert_dim))
+            self.experts = nn.ModuleList(expert() for _ in range(groups))
             self.router = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d // 2), nn.GELU(), nn.Linear(d // 2, groups))
             # The run neuron: picks a run count per sequence and expert. Trained last, on a frozen model.
             self.run_head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d // 2), nn.GELU(),
                                           nn.Linear(d // 2, groups * cfg.max_runs))
+            # The single-layer version: one neuron per run count, per expert.
+            self.run_neuron = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, groups * cfg.max_runs))
             self.experts.apply(self._init)
             self.router.apply(self._init)
             self.run_head.apply(self._init)
-            for expert in self.experts:
-                nn.init.zeros_(expert.net[-1].weight)
-                nn.init.zeros_(expert.net[-1].bias)
+            self.run_neuron.apply(self._init)
+            if not self.ngpt:  # nGPT experts start silent through their step size instead
+                for expert in self.experts:
+                    nn.init.zeros_(expert.net[-1].weight)
+                    nn.init.zeros_(expert.net[-1].bias)
             self.expert_embed = nn.Embedding(groups, d)
             nn.init.zeros_(self.expert_embed.weight)
         # Tells the output block how many runs happened. Plain has it too, for a fair comparison.
@@ -113,6 +124,12 @@ class Spidory(nn.Module):
         self.register_buffer("run_targets", torch.full((groups,), cfg.target_mean))
         self.register_buffer("expert_usage", torch.full((groups,), 1.0 / groups))
         self.register_buffer("run_head_ready", torch.tensor(False))
+        self.normalize_weights()
+
+    def normalize_weights(self) -> None:
+        """nGPT keeps weight rows at unit length; called after every optimizer step."""
+        if self.ngpt:
+            normalize_weights(self, self.tok)
 
     @staticmethod
     def _init(module: nn.Module) -> None:
@@ -122,15 +139,17 @@ class Spidory(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def _encode(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.tok(tokens) + self.pos(torch.arange(tokens.size(1), device=tokens.device))
+        h = self.tok(tokens)
+        if not self.ngpt:
+            h = h + self.pos(torch.arange(tokens.size(1), device=tokens.device))
         for block in self.input_block:
             h = block(h)
         # Attention is causal, so these states depend only on the first `prefix` tokens.
         return h, h[:, : self.cfg.prefix].mean(dim=1)
 
     def _unit(self, h: torch.Tensor) -> torch.Tensor:
-        """Dory's per-token L2 normalization, scaled by sqrt(d) to suit these standard blocks."""
-        return F.normalize(h, dim=-1, eps=1e-6) * self.cfg.d_model ** 0.5
+        """Dory's per-token L2 normalization: unit length with nGPT, sqrt(d) for the old blocks."""
+        return F.normalize(h, dim=-1, eps=1e-6) * (1.0 if self.ngpt else self.cfg.d_model ** 0.5)
 
     def _run_once(self, s, x, gates):
         """Dory's loop: u = N(s + x), then s = N(F(u)). Experts join inside F."""
@@ -142,17 +161,44 @@ class Spidory(nn.Module):
             for e, expert in enumerate(self.experts):
                 weight = gates[:, e]
                 if grad_path or weight.any():  # zero gates still carry gradient
-                    h = h + weight[:, None, None] * expert(h)
+                    if self.ngpt:
+                        step = weight[:, None, None] * expert.alpha()
+                        h = unit(h + step * (expert.proposal(h) - h))
+                    else:
+                        h = h + weight[:, None, None] * expert(h)
         return self._unit(h)
 
     def _decode(self, h: torch.Tensor, ks: torch.Tensor, experts: torch.Tensor) -> torch.Tensor:
         """The output block is told the run count and which expert ran."""
-        h = h + self.run_embed(ks)[:, None]
+        runs = self.run_embed(ks)
+        h = h + (runs if ks.dim() == 2 else runs[:, None])  # one count per token, or per sequence
         if self.cfg.use_experts and (experts >= 0).all():
             h = h + self.expert_embed(experts)[:, None]
+        if self.ngpt:
+            h = unit(h)
         for block in self.output_block:
             h = block(h)
+        if self.ngpt:
+            return (h @ self.tok.weight.T) * self.s_z()
         return self.norm(h) @ self.tok.weight.T
+
+    def _loop_tokens(self, x, gates, ks: torch.Tensor) -> torch.Tensor:
+        """Per-token run counts: ks is (batch, tokens).
+
+        Every run passes all tokens through the core, because attention needs them. A token
+        that has finished keeps its state, so later tokens can still read it. Each token learns
+        from its own last run only (TBPTL depth 1 per token): run inputs are detached.
+        """
+        state, out = x, x
+        for run in range(1, int(ks.max()) + 1):
+            if torch.is_grad_enabled():
+                new = self._run_once(state.detach(), x, gates)
+            else:
+                new = self._run_once(state, x, gates)
+            active = (ks >= run)[:, :, None]
+            out = torch.where((ks == run)[:, :, None], new, out)
+            state = torch.where(active, new.detach() if torch.is_grad_enabled() else new, state)
+        return out
 
     def _loop(self, x, gates, ks: torch.Tensor) -> torch.Tensor:
         """TBPTL depth 1: earlier runs have no gradients, and only the last run trains.
@@ -176,17 +222,35 @@ class Spidory(nn.Module):
         router_logits, gates = None, gate_override
         if cfg.use_experts and experts_on and gate_override is None:
             router_logits = self.router(pooled)
-            if self.training:
-                gates = F.gumbel_softmax(router_logits, tau=tau, hard=True)
-            else:
-                gates = F.one_hot(router_logits.argmax(-1), cfg.n_experts).to(h0.dtype)
+            gates = self.route(router_logits, tau, self.training).to(h0.dtype)
         chosen = gates.argmax(-1) if gates is not None else torch.full((size,), -1, device=device)
         if callable(ks):
             ks = ks(chosen)
         elif isinstance(ks, int):
             ks = torch.full((size,), ks, device=device)
-        h = self._loop(self._unit(h0), gates, ks)
+        loop = self._loop_tokens if ks.dim() == 2 else self._loop
+        h = loop(self._unit(h0), gates, ks)
         return {"logits": self._decode(h, ks, chosen), "gates": gates, "router_logits": router_logits, "ks": ks}
+
+    def route(self, router_logits: torch.Tensor, tau: float, training: bool) -> torch.Tensor:
+        """Expert weights per sequence, summing to 1, with `active_experts` of them above zero.
+
+        One active expert uses straight-through Gumbel sampling, as before. Several use the
+        top choices of noisy logits, weighted by the router's softmax over just those.
+        """
+        top = self.cfg.active_experts
+        if top <= 1:
+            if training:
+                return F.gumbel_softmax(router_logits, tau=tau, hard=True)
+            return F.one_hot(router_logits.argmax(-1), self.cfg.n_experts).to(router_logits.dtype)
+        scores = router_logits
+        if training:
+            noise = -torch.log(-torch.log(torch.rand_like(router_logits).clamp(1e-9, 1 - 1e-9)))
+            scores = router_logits + noise * tau
+        chosen = scores.topk(top, dim=-1).indices
+        mask = torch.zeros_like(router_logits, dtype=torch.bool).scatter_(-1, chosen, True)
+        weights = F.softmax((router_logits / tau).masked_fill(~mask, float("-inf")), dim=-1)
+        return weights
 
     def pick_k(self, experts: torch.Tensor, targets: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         """A target between two integers picks one of them, chosen by u in [0, 1)."""
@@ -208,7 +272,8 @@ class Spidory(nn.Module):
 
     def run_logits(self, pooled: torch.Tensor) -> torch.Tensor:
         """Returns (batch, experts, max_runs)."""
-        return self.run_head(pooled).view(pooled.size(0), self.cfg.n_experts, self.cfg.max_runs)
+        head = self.run_neuron if self.cfg.neuron == "linear" else self.run_head
+        return head(pooled).view(pooled.size(0), self.cfg.n_experts, self.cfg.max_runs)
 
     def _choose(self, tokens, pooled, k, mean_runs, learned=False):
         cfg = self.cfg
@@ -233,7 +298,7 @@ class Spidory(nn.Module):
     @torch.no_grad()
     def infer(self, tokens: torch.Tensor, k: int | None = None, mean_runs: float | None = None,
               learned: bool = False):
-        """Real inference: one expert, stopping at the chosen run count. Groups equal choices."""
+        """Real inference: stops at the chosen run count. Groups sequences by top expert and count."""
         was_training = self.training
         self.eval()
         device = tokens.device
@@ -241,12 +306,11 @@ class Spidory(nn.Module):
         with amp(device):
             h0, pooled = self._encode(tokens)
             experts, ks = self._choose(tokens, pooled, k, mean_runs, learned)
+            all_gates = (self.route(self.router(pooled), 1.0, False).to(h0.dtype)
+                         if self.cfg.use_experts else None)
             for expert, count in torch.stack([experts, ks], 1).unique(dim=0).tolist():
                 rows = ((experts == expert) & (ks == count)).nonzero().squeeze(1)
-                gates = None
-                if expert >= 0:
-                    gates = torch.zeros(len(rows), self.cfg.n_experts, device=device, dtype=h0.dtype)
-                    gates[:, expert] = 1.0
+                gates = None if expert < 0 else all_gates[rows]
                 x = self._unit(h0[rows])
                 h = x
                 for _ in range(count):
@@ -255,8 +319,32 @@ class Spidory(nn.Module):
         self.train(was_training)
         return logits, experts, ks
 
+    @torch.no_grad()
+    def infer_tokens(self, tokens: torch.Tensor, ks: torch.Tensor):
+        """Inference with a run count per token, such as the training cycle."""
+        was_training = self.training
+        self.eval()
+        with amp(tokens.device):
+            logits = self(tokens, ks=ks)["logits"].float()
+        self.train(was_training)
+        return logits
+
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+def run_penalty(run_probs: torch.Tensor, gates: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Two-sided: punishes each expert's average runs for being above or below its target.
+
+    run_probs is (batch, max_runs) for each sequence's chosen expert; gates is (batch, experts).
+    """
+    counts = torch.arange(1, run_probs.size(-1) + 1, device=run_probs.device, dtype=run_probs.dtype)
+    expected = (run_probs * counts).sum(-1)
+    weights = gates.detach().to(expected.dtype)
+    usage = weights.sum(0)
+    means = (weights * expected[:, None]).sum(0) / usage.clamp(min=1e-6)
+    share = usage / usage.sum().clamp(min=1e-6)
+    return (share * (means - targets.to(means.dtype)) ** 2).sum()
 
 
 def balance_penalty(router_logits: torch.Tensor) -> torch.Tensor:

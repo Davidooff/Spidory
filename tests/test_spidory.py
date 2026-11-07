@@ -27,7 +27,10 @@ def tokens(size=6):
 def wake_experts(model):
     with torch.no_grad():
         for expert in model.experts:
-            expert.net[-1].weight.normal_(std=0.1)
+            if hasattr(expert, "net"):
+                expert.net[-1].weight.normal_(std=0.1)
+            else:
+                expert.alpha.value.normal_(std=0.5)  # nGPT experts start silent through alpha
         model.router[-1].weight.normal_(std=2.0)
 
 
@@ -78,7 +81,7 @@ def test_gradients_reach_input_router_and_experts():
     loss.backward()
     assert model.input_block[0].qkv.weight.grad.abs().sum() > 0
     assert model.router[-1].weight.grad.abs().sum() > 0
-    assert all(e.net[-1].weight.grad is not None for e in model.experts)
+    assert all(all(p.grad is not None for p in e.parameters()) for e in model.experts)
 
 
 def test_input_gradient_reaches_every_row_through_last_run():
@@ -143,7 +146,7 @@ def test_state_size_stays_fixed_across_runs():
         s = x
         for _ in range(4):
             s = model._run_once(s, x, None)
-            assert torch.allclose(s.norm(dim=-1), torch.tensor(CFG.d_model ** 0.5), atol=1e-3)
+            assert torch.allclose(s.norm(dim=-1), torch.tensor(1.0), atol=1e-3)  # nGPT: unit length
 
 
 def test_per_sequence_k_matches_single_sequences():
@@ -176,7 +179,7 @@ def test_experts_start_at_zero():
     with torch.no_grad():
         off = model(batch, ks=2, experts_on=False)["logits"]
         on = model(batch, ks=2)["logits"]
-    assert torch.equal(off, on)
+    assert torch.allclose(off, on, atol=1e-5)
 
 
 def test_zero_gate_disables_expert():
@@ -421,7 +424,7 @@ def test_rules_need_every_seed_and_more_than_one():
 
 
 def test_tflops_match_hand_count_and_grow_with_runs():
-    cfg = replace(CFG, use_experts=False, n_input=0, n_core=1, n_output=0)
+    cfg = replace(CFG, use_experts=False, n_input=0, n_core=1, n_output=0, arch="prenorm")
     d, t = cfg.d_model, cfg.seq_len
     block = 8 * d * d * t + 3 * d * d * t + d * d * t + 2 * t * t * d  # ffn, qkv, proj, attention
     per_run = 2 * block / t / 1e12  # 2 FLOPs per multiply-add
@@ -438,7 +441,7 @@ def test_average_tflops_weights_by_real_choices():
 def test_default_model_keeps_dory_proportions():
     cfg = ModelConfig()
     assert (cfg.n_input, cfg.n_core, cfg.n_output) == (4, 10, 4)
-    assert 10e6 < Spidory(replace(cfg, use_experts=False)).num_params() < 25e6
+    assert 20e6 < Spidory(replace(cfg, use_experts=False)).num_params() < 30e6
 
 
 def test_run_target_is_smallest_count_near_the_best():
@@ -484,6 +487,14 @@ def test_older_checkpoints_still_load(corpus, tmp_path):
 def test_run_head_trains_only_after_everything_else():
     model = Spidory(CFG)
     assert not bool(model.run_head_ready)
+
+
+def test_training_stops_on_a_broken_loss(corpus, monkeypatch):
+    import spidory.train as train
+    model = Spidory(CFG)
+    monkeypatch.setattr(train, "compute_loss", lambda *a: (torch.tensor(float("nan"), requires_grad=True), {}))
+    with pytest.raises(RuntimeError, match="loss became"):
+        train.train_steps(model, make_optimizer(model, TCFG), corpus, TCFG, 0, 1)
 
 
 def test_plain_is_a_bit_smaller():

@@ -96,6 +96,31 @@ def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, *
     return found
 
 
+@torch.no_grad()
+def cycle_loss(model, corpus: Corpus, windows: int) -> dict:
+    """Loss per dataset with the training cycle: runs 1, 2, 3, 4, 1, ... across tokens."""
+    from .train import cycle_ks
+    import torch.nn.functional as F
+
+    device = next(model.parameters()).device
+    losses, by_runs = {}, torch.zeros(model.cfg.max_runs)
+    counts = torch.zeros(model.cfg.max_runs)
+    for name in DATASETS:
+        total = 0.0
+        batch = corpus.fixed_windows(name, "test", windows).to(device)
+        for row in batch.split(32):
+            ks = cycle_ks(row.size(0), row.size(1) - 1, model.cfg.max_runs, device)
+            each = F.cross_entropy(model.infer_tokens(row[:, :-1], ks).flatten(0, 1), row[:, 1:].flatten(),
+                                   reduction="none").cpu()
+            total += float(each.sum())
+            flat = ks.flatten().cpu() - 1
+            by_runs.index_add_(0, flat, each)
+            counts.index_add_(0, flat, torch.ones_like(each))
+        losses[name] = round(total / (windows * model.cfg.seq_len), 4)
+    return {"loss": losses, "mean_loss": round(sum(losses.values()) / len(losses), 4),
+            "loss_by_token_runs": [round(float(v), 4) for v in by_runs / counts.clamp(min=1)]}
+
+
 def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: torch.device) -> dict:
     model, _, step, _, _ = load(Path("runs") / run / "last.pt", device)
     corpus = Corpus(corpus_root, model.cfg.seq_len)
@@ -112,6 +137,7 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
                 "maths_levels": levels}
 
     cost = tflops_by_k(model.cfg)
+    result["cycle"] = cycle_loss(model, corpus, windows)
     for k in K_GRID:
         result["by_k"][str(k)] = score(k=k) | {"tflops_per_token": cost[k]}
     for mean in MEAN_GRID:
@@ -204,11 +230,14 @@ def loop_check(run: str, corpus_root: str, windows: int, questions: int, device:
     overall = {k: v["all"] for k, v in accuracy.items()}
     gain = (losses[1] - min(losses[k] for k in K_GRID[1:])) / losses[1]
     points = max(overall[k] for k in K_GRID[1:]) - overall[1]
-    passed = gain >= 0.01 or points >= 0.02
+    # Judged per dataset, so one overfit dataset cannot hide a real gain elsewhere.
+    per_dataset = {n: (by_k[1][n] - min(by_k[k][n] for k in K_GRID[1:])) / by_k[1][n] for n in by_k[1]}
+    passed = max(per_dataset.values()) >= 0.01 or points >= 0.02
     report = {"val_loss_by_k": {k: round(v, 4) for k, v in losses.items()},
               "dataset_loss_by_k": {k: {n: round(x, 4) for n, x in v.items()} for k, v in by_k.items()},
               "maths_accuracy_by_k": accuracy, "loss_gain": round(gain, 4),
-              "accuracy_points": round(points, 4), "pass": passed}
+              "accuracy_points": round(points, 4),
+              "dataset_gain": {n: round(g, 4) for n, g in per_dataset.items()}, "pass": passed}
     print(json.dumps(report), flush=True)
     Path("runs/loop_check.json").write_text(json.dumps(report, indent=2))
     return passed
@@ -231,6 +260,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--loop-check", help="run name: exit 3 if loops do not help")
     parser.add_argument("--single", help="evaluate one run name and write it alone")
+    parser.add_argument("--names", nargs="+", help="run names to compare; must include plain and constant")
     parser.add_argument("--data", default="data")
     parser.add_argument("--windows", type=int, default=512)
     parser.add_argument("--questions", type=int, default=500)
@@ -245,6 +275,19 @@ def main() -> None:
         result = evaluate(args.single, args.data, args.windows, args.questions, device)
         Path(args.out).write_text(json.dumps(result, indent=2))
         print(table([result]))
+        return
+
+    if args.names:
+        report = []
+        for seed in args.seeds:
+            runs = {name: evaluate(f"{name}_s{seed}", args.data, args.windows, args.questions, device)
+                    for name in args.names}
+            print(table(list(runs.values())))
+            rules = {name: verdict(runs["plain"], runs["constant"], run)
+                     for name, run in runs.items() if name not in ("plain", "constant")}
+            print(json.dumps(rules, indent=2), flush=True)
+            report.append({"seed": seed, "runs": runs, "rules": rules})
+        Path(args.out).write_text(json.dumps({"seeds": report}, indent=2))
         return
 
     report = []

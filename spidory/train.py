@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from .config import ModelConfig, TrainConfig, to_dict
 from .data import DATASETS, Corpus
+from .joint import joint_step
 from .model import Spidory, amp, compute_loss
 
 
@@ -24,7 +25,9 @@ def pick_device(name: str) -> torch.device:
 
 
 def make_optimizer(model: Spidory, cfg: TrainConfig) -> torch.optim.AdamW:
-    return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # nGPT keeps weights on the unit sphere, so it uses no weight decay.
+    decay = 0.0 if getattr(model, "ngpt", False) else cfg.weight_decay
+    return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=decay)
 
 
 def tau_at(step: int, cfg: TrainConfig) -> float:
@@ -41,8 +44,21 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
     return cfg.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t)))
 
 
-def sample_ks(step: int, cfg: TrainConfig, model: Spidory, experts: torch.Tensor) -> torch.Tensor:
-    """Run counts for one batch, by stage."""
+def cycle_ks(size: int, tokens: int, top: int, device) -> torch.Tensor:
+    """Each next token gets one more run, back to 1 after the maximum: 1, 2, 3, 4, 1, ...
+
+    A random start per sequence lets every position see every run count.
+    """
+    offset = torch.randint(top, (size, 1))
+    return ((torch.arange(tokens)[None] + offset) % top + 1).to(device)
+
+
+def stage3_start(cfg: TrainConfig) -> int:
+    return cfg.stage1_steps + cfg.stage2_steps + cfg.cycle_steps
+
+
+def sample_ks(step: int, cfg: TrainConfig, model: Spidory, experts: torch.Tensor, tokens: int = 0):
+    """Run counts for one batch, by stage: per sequence, or per token in the cycle stage."""
     size, device, top = experts.numel(), experts.device, model.cfg.max_runs
     if step < cfg.stage1_steps:
         return torch.ones(size, dtype=torch.long, device=device)
@@ -50,6 +66,8 @@ def sample_ks(step: int, cfg: TrainConfig, model: Spidory, experts: torch.Tensor
         if torch.rand(1).item() < cfg.one_run_share:
             return torch.ones(size, dtype=torch.long, device=device)
         return torch.randint(1, top + 1, (size,)).to(device)
+    if step < stage3_start(cfg):
+        return cycle_ks(size, tokens, top, device)
     ks = model.pick_k(experts, model.run_targets, torch.rand(size).to(device))
     explore = torch.rand(size).to(device) < cfg.explore
     return torch.where(explore, torch.randint(1, top + 1, (size,)).to(device), ks)
@@ -65,13 +83,20 @@ def train_steps(model, optimizer, corpus: Corpus, cfg: TrainConfig, start: int, 
         for group in optimizer.param_groups:
             group["lr"] = lr_at(step, cfg)
         with amp(device):
-            out = model(batch[:, :-1], ks=lambda experts: sample_ks(step, cfg, model, experts),
-                        tau=tau_at(step, cfg), experts_on=step >= cfg.experts_from)
-            loss, parts = compute_loss(out, batch[:, 1:], cfg.balance_penalty)
+            stage3 = step >= stage3_start(cfg)
+            if stage3 and model.cfg.use_experts and model.cfg.run_mode == "joint":
+                loss, parts = joint_step(model, batch[:, :-1], batch[:, 1:], cfg, tau_at(step, cfg))
+            else:
+                out = model(batch[:, :-1], ks=lambda experts: sample_ks(step, cfg, model, experts, batch.size(1) - 1),
+                            tau=tau_at(step, cfg), experts_on=step >= cfg.experts_from)
+                loss, parts = compute_loss(out, batch[:, 1:], cfg.balance_penalty)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"loss became {loss.item()} at step {step}; stopping instead of wasting compute")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
+        model.normalize_weights()
         done = step + 1
         if log and (done % cfg.log_every == 0 or done == stop):
             rate = (done - start) * cfg.batch_size * model.cfg.seq_len / (time.time() - began)
@@ -131,7 +156,12 @@ def load(path: Path, device: torch.device):
     """Checkpoints are device independent: everything maps to `device` on load."""
     state = torch.load(path, weights_only=True, map_location=device)
     tcfg = TrainConfig(**state["train_cfg"])
-    model = Spidory(ModelConfig(**state["model_cfg"])).to(device)
+    # Checkpoints from before nGPT have no "arch" and use the old blocks.
+    model = Spidory(ModelConfig(**{"arch": "prenorm", **state["model_cfg"]})).to(device)
+    # Checkpoints from before the single-layer neuron existed get a fresh one.
+    for key, value in model.state_dict().items():
+        if key.startswith("run_neuron."):
+            state["model"].setdefault(key, value)
     state["model"].setdefault("run_head_ready", torch.tensor(False, device=device))
     model.load_state_dict(state["model"])
     optimizer = make_optimizer(model, tcfg)
@@ -145,12 +175,18 @@ def main() -> None:
     parser.add_argument("--plain", action="store_true", help="Dory only, no experts")
     parser.add_argument("--stage1", type=int, default=TrainConfig.stage1_steps)
     parser.add_argument("--stage2", type=int, default=TrainConfig.stage2_steps)
+    parser.add_argument("--cycle", type=int, default=TrainConfig.cycle_steps,
+                        help="stage 2b steps, where run counts cycle 1-4 across tokens")
     parser.add_argument("--total", type=int, default=TrainConfig.steps,
                         help="length of the shared schedule, including rounds")
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--seq-len", type=int, default=ModelConfig.seq_len)
     parser.add_argument("--d-model", type=int, default=ModelConfig.d_model)
     parser.add_argument("--expert-dim", type=int, default=ModelConfig.expert_dim)
+    parser.add_argument("--arch", choices=["ngpt", "prenorm"], default=ModelConfig.arch)
+    parser.add_argument("--active-experts", type=int, default=ModelConfig.active_experts)
+    parser.add_argument("--lr", type=float, default=TrainConfig.lr)
+    parser.add_argument("--warmup", type=int, default=TrainConfig.warmup_lr_steps)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--device", default="auto")
@@ -165,16 +201,19 @@ def main() -> None:
     run.mkdir(parents=True, exist_ok=True)
     ckpt = run / "last.pt"
     corpus = Corpus(args.data, args.seq_len, seed=args.seed)
-    stop = args.stage1 + args.stage2
+    stop = args.stage1 + args.stage2 + args.cycle
 
     if ckpt.exists():
         model, optimizer, start, cfg, state = load(ckpt, device)
         set_rng_state(state["rng"], corpus)
     else:
-        cfg = TrainConfig(stage1_steps=args.stage1, stage2_steps=args.stage2, steps=args.total,
-                          batch_size=args.batch_size, seed=args.seed)
+        cfg = TrainConfig(stage1_steps=args.stage1, stage2_steps=args.stage2, cycle_steps=args.cycle,
+                          steps=args.total,
+                          batch_size=args.batch_size, seed=args.seed, lr=args.lr,
+                          warmup_lr_steps=args.warmup)
         model = Spidory(ModelConfig(seq_len=args.seq_len, use_experts=not args.plain, d_model=args.d_model,
-                                    expert_dim=args.expert_dim)).to(device)
+                                    expert_dim=args.expert_dim, arch=args.arch,
+                                    active_experts=args.active_experts)).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
     if start >= stop:

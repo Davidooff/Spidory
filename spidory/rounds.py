@@ -83,6 +83,14 @@ def choose_group(activation: dict[str, torch.Tensor], table: torch.Tensor, targe
     return group[: overall.numel() // 2]
 
 
+def lift_group(activation: dict[str, torch.Tensor], dataset: str, lift: float) -> list[int]:
+    """Experts unusually active on this dataset, at most half of all experts."""
+    overall = overall_usage(activation)
+    lifts = activation[dataset] / overall.clamp(min=1e-6)
+    ranked = lifts.argsort(descending=True).tolist()
+    return [e for e in ranked if lifts[e] > lift][: overall.numel() // 2]
+
+
 def snapshot(model, optimizer) -> dict:
     return copy.deepcopy({"model": model.state_dict(), "optimizer": optimizer.state_dict()})
 
@@ -121,7 +129,11 @@ def run_rounds(model, optimizer, corpus: Corpus, tcfg, rcfg: RoundConfig, start:
         if model.cfg.use_experts:
             activation = measure_activation(model, corpus, "val", windows)
             model.expert_usage.copy_(overall_usage(activation).to(model.expert_usage))
-            if not control_only:
+            if not control_only and model.cfg.run_mode == "joint":
+                # The user's rule: raise the experts most active on this dataset. The neuron
+                # learns where the extra runs help, so no measured gain is needed first.
+                group = lift_group(activation, dataset, rcfg.lift)
+            elif not control_only:
                 table = loss_table(model, corpus, "val", windows)[dataset]
                 group = choose_group(activation, table, model.run_targets.cpu(), dataset,
                                      rcfg.lift, rcfg.min_gain)
@@ -158,6 +170,9 @@ def main() -> None:
     parser.add_argument("--name", required=True)
     parser.add_argument("--warm", required=True, help="stage 2 run to start from")
     parser.add_argument("--control-only", action="store_true")
+    parser.add_argument("--run-mode", choices=["table", "joint"], default=None)
+    parser.add_argument("--neuron", choices=["net", "linear"], default=None)
+    parser.add_argument("--neuron-train", choices=["sampled", "average", "mix"], default=None)
     parser.add_argument("--passes", type=int, default=RoundConfig.passes)
     parser.add_argument("--round-steps", type=int, default=RoundConfig.steps)
     parser.add_argument("--seed", type=int, default=0)
@@ -174,6 +189,13 @@ def main() -> None:
     ckpt = run / "last.pt"
     resumed = ckpt.exists()
     model, optimizer, start, tcfg, state = load(ckpt if resumed else Path("runs") / args.warm / "last.pt", device)
+    if not resumed:
+        changes = {k: v for k, v in (("run_mode", args.run_mode), ("neuron", args.neuron),
+                                     ("neuron_train", args.neuron_train)) if v is not None}
+        model.cfg = replace(model.cfg, **changes)
+        if model.cfg.run_mode == "joint":
+            model.run_head_ready.fill_(True)
+    print(f"{args.name}: {model.cfg.run_mode} runs, neuron {model.cfg.neuron}, {model.cfg.neuron_train}", flush=True)
     rcfg = replace(RoundConfig(), steps=args.round_steps, passes=args.passes)
     corpus = Corpus(args.data, model.cfg.seq_len, seed=args.seed)
     resume = (0, 0)

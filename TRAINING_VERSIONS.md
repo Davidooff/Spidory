@@ -35,9 +35,22 @@ splits that training never saw.
   Maths accuracy 99.2%.
 - The neuron chose about 2 runs for story and code, 1 for maths and 1.3 for QA.
 
-## v3: planned, the user's run-neuron design
+## v3 attempt 1: early check failed (24M, data v2)
+- Plain only. Two runs beat one on every dataset, but no dataset gained 1%:
+  story 0.77%, code 0.69%, QA 0.42%, maths 0.09%, maths accuracy +1.8 points.
+- Data v2 fixed QA overfitting (held-out loss 3.0, from 5.3), and maths reached about 67%.
+
+## v3: the user's run-neuron design, on nGPT
+- Architecture moved to Dory's: nGPT blocks (unit-length states and weights, learned step
+  sizes, no LayerNorm, no weight decay), SwiGLU, RoPE, plus Dory's attention-output gates and
+  extra normalizations.
+- Data v3: 856M training tokens (story 406M, maths 120M, code 159M, QA 171M).
+- Learning rate 6e-3 with 1,000 warm-up steps, from a laptop comparison where nGPT at 6e-3 beat
+  the old blocks' best by 8% loss after 1,200 steps.
 - Data v2: maths levels 2 and 5-9 (long chains, variable tracking, nested brackets) and QA
   grown to 171M tokens with HotpotQA, Natural Questions and Simple Wikipedia.
 - Run neuron trained jointly with the model in stage 3, with a two-sided penalty on each
   expert's average, and group targets raised by activation while the overall average stays 2.5.
-- Compares a single-layer neuron with a small network, against Plain and Constant, over 2 seeds.
+- Three ways to train the neuron: sampled run count, the average of all 4 run counts (the
+  user's note), and mixing run states (the original idea). A single-layer neuron is compared
+  with a small network on the sampled way. All against Plain and Constant, one seed.
