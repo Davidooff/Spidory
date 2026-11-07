@@ -232,6 +232,8 @@ class Spidory(nn.Module):
         h = loop(self._unit(h0), gates, ks)
         return {"logits": self._decode(h, ks, chosen), "gates": gates, "router_logits": router_logits, "ks": ks}
 
+    route_tau = 0.3  # routing temperature at test time: where training's sharpening ends
+
     def route(self, router_logits: torch.Tensor, tau: float, training: bool) -> torch.Tensor:
         """Expert weights per sequence, summing to 1, with `active_experts` of them above zero.
 
@@ -282,6 +284,9 @@ class Spidory(nn.Module):
                    else torch.full((size,), -1, device=tokens.device))
         if k is not None:
             return experts, torch.full((size,), k, device=tokens.device)
+        if learned and cfg.neuron_train == "mix":
+            # The mix variant blends every run's state, so it always computes all of them.
+            return experts, torch.full((size,), cfg.max_runs, device=tokens.device)
         if learned:
             return experts, self.run_logits(pooled)[torch.arange(size), experts].argmax(-1) + 1
         mean = cfg.target_mean if mean_runs is None else mean_runs
@@ -306,16 +311,25 @@ class Spidory(nn.Module):
         with amp(device):
             h0, pooled = self._encode(tokens)
             experts, ks = self._choose(tokens, pooled, k, mean_runs, learned)
-            all_gates = (self.route(self.router(pooled), 1.0, False).to(h0.dtype)
+            all_gates = (self.route(self.router(pooled), self.route_tau, False).to(h0.dtype)
                          if self.cfg.use_experts else None)
+            mix = learned and self.cfg.neuron_train == "mix" and k is None and mean_runs is None
             for expert, count in torch.stack([experts, ks], 1).unique(dim=0).tolist():
                 rows = ((experts == expert) & (ks == count)).nonzero().squeeze(1)
                 gates = None if expert < 0 else all_gates[rows]
                 x = self._unit(h0[rows])
                 h = x
+                states = []
                 for _ in range(count):
                     h = self._run_once(h, x, gates)
-                logits[rows] = self._decode(h, ks[rows], experts[rows]).to(logits.dtype)
+                    states.append(h)
+                shown = ks[rows]
+                if mix:
+                    # Test the way it trains: the neuron-weighted mix of every run's state.
+                    probs = F.softmax(self.run_logits(pooled[rows])[:, expert].float(), dim=-1).to(h.dtype)
+                    h = (probs[:, :, None, None] * torch.stack(states, 1)).sum(1)
+                    shown = probs.argmax(-1) + 1
+                logits[rows] = self._decode(h, shown, experts[rows]).to(logits.dtype)
         self.train(was_training)
         return logits, experts, ks
 

@@ -156,3 +156,31 @@ def test_one_active_expert_is_unchanged():
     wake_experts(model)
     gates = model.route(model.router(model._encode(tokens(6))[1]), 1.0, False)
     assert gates.eq(0).logical_or(gates.eq(1)).all() and gates.sum(-1).eq(1).all()
+
+
+def test_mix_variant_is_tested_with_the_mix_it_trains_on():
+    model = model_for("mix").eval()
+    batch = tokens(3)
+    logits, experts, ks = model.infer(batch, learned=True)
+    assert ks.eq(CFG.max_runs).all()  # it computes every run
+    with torch.no_grad():
+        pooled = model._encode(batch)[1]
+        probs = torch.softmax(model.run_logits(pooled)[torch.arange(3), experts].float(), -1)
+        x = model._unit(model._encode(batch)[0])
+        gates = model.route(model.router(pooled), model.route_tau, False)
+        h, states = x, []
+        for _ in range(CFG.max_runs):
+            h = model._run_once(h, x, gates)
+            states.append(h)
+        mixed = (probs[:, :, None, None] * torch.stack(states, 1)).sum(1)
+        expected = model._decode(mixed, probs.argmax(-1) + 1, experts)
+    assert torch.allclose(logits, expected, atol=1e-4)
+
+
+def test_two_experts_use_the_training_temperature_at_test():
+    model = Spidory(replace(CFG, active_experts=2)).eval()
+    wake_experts(model)
+    logits = model.router(model._encode(tokens(4))[1])
+    sharp = model.route(logits, model.route_tau, False)
+    assert model.route_tau == pytest.approx(TrainConfig().tau_end)
+    assert sharp.max(-1).values.mean() >= model.route(logits, 1.0, False).max(-1).values.mean()
