@@ -6,10 +6,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 INSTANCE=${1:?instance id required}
-LOCAL=runs/remote_v3
-LOG=runs/stop_rent_v3.log
+LOCAL=${LOCAL:-runs/remote_v3}
+LOG=${LOG:-runs/stop_rent_v3.log}
 CHECK_ONLY=${2:-}
-read -r HOST PORT < /tmp/claude-1000/-home-david-projects-Spidory/e0700a11-f54c-4d9e-afbb-b9c196a6def7/scratchpad/vast_host_v3
+read -r HOST PORT < "${HOST_FILE:-/tmp/claude-1000/-home-david-projects-Spidory/e0700a11-f54c-4d9e-afbb-b9c196a6def7/scratchpad/vast_host_v3}"
 SSH="timeout 60 ssh -q -n -p $PORT -o ConnectTimeout=20 -o ServerAliveInterval=15 root@$HOST"
 RSH="ssh -q -p $PORT -o ConnectTimeout=20 -o ServerAliveInterval=15"
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
