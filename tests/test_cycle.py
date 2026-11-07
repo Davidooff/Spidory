@@ -71,3 +71,17 @@ def test_cycle_stage_trains_end_to_end_and_is_evaluated(corpus):  # noqa: F811
     found = cycle_loss(model, corpus, 4)
     assert set(found["loss"]) == {"story", "maths", "code", "qa"}
     assert len(found["loss_by_token_runs"]) == CFG.max_runs
+
+
+def test_pieces_give_the_same_update_as_the_whole_batch(corpus):  # noqa: F811
+    cfg = replace(TCFG, stage1_steps=0, stage2_steps=0, cycle_steps=5, batch_size=8)
+    grads = []
+    for pieces in (1, 4):
+        torch.manual_seed(0)
+        model = Spidory(replace(CFG, use_experts=False))
+        torch.manual_seed(1)
+        corpus.reseed(1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        train_steps(model, optimizer, corpus, replace(cfg, heavy_pieces=pieces), 0, 1)
+        grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
+    assert torch.allclose(grads[0], grads[1], atol=1e-5)
