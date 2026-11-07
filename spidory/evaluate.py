@@ -205,9 +205,20 @@ def policy_test(model, corpus: Corpus, windows: int) -> dict:
     per_dataset = {n: min(K_GRID, key=lambda k: float(val[k][n].mean())) for n in DATASETS}
     fixed = test[best]
     by_dataset = {n: test[per_dataset[n]][n] for n in DATASETS}
+    cost = tflops_by_k(model.cfg)
+    chosen = decisions(model, corpus, windows, learned=True)
+    learned_cost = average_tflops(cost, chosen["run_counts"])
+    fixed_cost = cost[best]
+    per_dataset_cost = sum(cost[k] for k in per_dataset.values()) / len(DATASETS)
+    vs_fixed, vs_dataset = paired_ci(learned, fixed), paired_ci(learned, by_dataset)
     return {"best_fixed_k": best, "per_dataset_k": per_dataset,
             "per_dataset_mean_k": sum(per_dataset.values()) / len(DATASETS),
-            "vs_best_fixed": paired_ci(learned, fixed), "vs_per_dataset": paired_ci(learned, by_dataset)}
+            "learned_mean_runs": chosen["mean_runs"],
+            "tflops": {"learned": learned_cost, "best_fixed": fixed_cost, "per_dataset": per_dataset_cost},
+            "vs_best_fixed": vs_fixed | {"at_no_more_compute": learned_cost <= fixed_cost * 1.001},
+            "vs_per_dataset": vs_dataset | {"at_no_more_compute": learned_cost <= per_dataset_cost * 1.001},
+            "note": "A win counts only with ours_better and at_no_more_compute. The mix variant always "
+                    "computes every run, and its fixed-run baselines decode states it never saw alone."}
 
 
 def constant_at(result: dict, mean: float) -> dict[str, float]:
@@ -255,8 +266,10 @@ def verdict(plain: dict, constant: dict, variable: dict) -> dict:
     info = variable["by_mean"]["2.5"]
     policy = variable.get("policy") or {}
     return {"policy": policy,
-            "beats_best_fixed": bool(policy.get("vs_best_fixed", {}).get("ours_better")),
-            "beats_per_dataset": bool(policy.get("vs_per_dataset", {}).get("ours_better")),
+            "beats_best_fixed": bool(policy.get("vs_best_fixed", {}).get("ours_better")
+                                     and policy.get("vs_best_fixed", {}).get("at_no_more_compute")),
+            "beats_per_dataset": bool(policy.get("vs_per_dataset", {}).get("ours_better")
+                                      and policy.get("vs_per_dataset", {}).get("at_no_more_compute")),
             "learned_gain": learned_gain, "learned_pass": bool(learned_gain is not None and learned_gain >= 0.01),
             "learned_mean_runs": learned["mean_runs"] if learned else None,
             "learned_run_counts": learned["run_counts"] if learned else None,

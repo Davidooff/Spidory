@@ -123,7 +123,9 @@ def run_rounds(model, optimizer, corpus: Corpus, tcfg, rcfg: RoundConfig, start:
             torch.manual_seed(round_seed)
             corpus.reseed(round_seed)
             train_steps(model, optimizer, corpus, tcfg, step, stop, dataset, rcfg.focus_share)
-            return heldout_loss(model, corpus, "val", windows)
+            # Neuron models are judged on their own run choices, as they will be used.
+            joint = model.cfg.use_experts and model.cfg.run_mode == "joint"
+            return heldout_loss(model, corpus, "val", windows, learned=joint)
 
         group: list[int] = []
         if model.cfg.use_experts:

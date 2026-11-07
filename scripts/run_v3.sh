@@ -24,5 +24,5 @@ $PY -m spidory.rounds --name neuron_net_average_s$SEED --warm moe_warm_s$SEED --
 $PY -m spidory.rounds --name neuron_net_mix_s$SEED --warm moe_warm_s$SEED --run-mode joint --neuron net --neuron-train mix $R || fail "neuron net mix failed"
 $PY -m spidory.train --name moe2_warm_s$SEED --active-experts 2 $COMMON || fail "two-expert training failed"
 $PY -m spidory.rounds --name neuron_net_sampled_top2_s$SEED --warm moe2_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "two-expert neuron failed"
-$PY -m spidory.evaluate --seeds $SEED --names plain constant neuron_net_sampled neuron_one_sampled neuron_net_average neuron_net_mix neuron_net_sampled_top2 --out runs/results_v3.json | tee runs/results_v3.txt
+$PY -m spidory.evaluate --seeds $SEED --names plain constant neuron_net_sampled neuron_one_sampled neuron_net_average neuron_net_mix neuron_net_sampled_top2 --out runs/results_v3.json > runs/results_v3.txt 2>&1 || fail "evaluation failed"
 touch runs/DONE
