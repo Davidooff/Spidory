@@ -77,7 +77,7 @@ def test_gradients_reach_input_router_and_experts():
     model = Spidory(CFG).train()
     wake_experts(model)
     batch = tokens(32)
-    loss, _ = compute_loss(model(batch[:, :-1], ks=3), batch[:, 1:], 0.2)
+    loss, _ = compute_loss(model(batch[:, :-1], ks=3), batch[:, 1:], TCFG)
     loss.backward()
     assert model.input_block[0].qkv.weight.grad.abs().sum() > 0
     assert model.router[-1].weight.grad.abs().sum() > 0
@@ -133,7 +133,7 @@ def test_gradients_reach_output_signals():
     model = Spidory(CFG).train()
     wake_experts(model)
     batch = tokens(16)
-    loss, _ = compute_loss(model(batch[:, :-1], ks=2), batch[:, 1:], 0.0)
+    loss, _ = compute_loss(model(batch[:, :-1], ks=2), batch[:, 1:], replace(TCFG, balance_penalty=0.0, router_sharpen=0.0))
     loss.backward()
     assert model.run_embed.weight.grad[2].abs().sum() > 0
     assert model.expert_embed.weight.grad.abs().sum() > 0
@@ -206,7 +206,7 @@ def test_router_sees_only_prefix():
 
 
 def test_dataset_names_cannot_enter_the_loss():
-    assert list(inspect.signature(compute_loss).parameters) == ["out", "targets", "balance_weight"]
+    assert list(inspect.signature(compute_loss).parameters) == ["out", "targets", "cfg"]
 
 
 @pytest.mark.parametrize("mean", [1.5, 2.0, 2.5, 3.0, 3.5])
@@ -548,7 +548,7 @@ def test_overfits_tiny_batch(ks):
     batch = torch.randint(0, cfg.vocab_size, (4, cfg.seq_len))
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
     for _ in range(300):
-        loss, parts = compute_loss(model(batch[:, :-1], ks=ks, tau=0.5), batch[:, 1:], 0.0)
+        loss, parts = compute_loss(model(batch[:, :-1], ks=ks, tau=0.5), batch[:, 1:], replace(TCFG, balance_penalty=0.0, router_sharpen=0.0))
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

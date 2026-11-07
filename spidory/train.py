@@ -112,7 +112,7 @@ def train_steps(model, optimizer, corpus: Corpus, cfg: TrainConfig, start: int, 
                 else:
                     out = model(piece[:, :-1], ks=lambda experts: sample_ks(step, cfg, model, experts, piece.size(1) - 1),
                                 tau=tau_at(step, cfg), experts_on=step >= cfg.experts_from)
-                    loss, parts = compute_loss(out, piece[:, 1:], cfg.balance_penalty)
+                    loss, parts = compute_loss(out, piece[:, 1:], cfg)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"loss became {loss.item()} at step {step}; stopping instead of wasting compute")
             (loss * piece.size(0) / batch.size(0)).backward()
@@ -210,6 +210,7 @@ def main() -> None:
     parser.add_argument("--expert-dim", type=int, default=ModelConfig.expert_dim)
     parser.add_argument("--arch", choices=["ngpt", "prenorm"], default=ModelConfig.arch)
     parser.add_argument("--active-experts", type=int, default=ModelConfig.active_experts)
+    parser.add_argument("--route-per-loop", action="store_true", help="the router picks again before each run")
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
     parser.add_argument("--warmup", type=int, default=TrainConfig.warmup_lr_steps)
     parser.add_argument("--seed", type=int, default=0)
@@ -238,7 +239,7 @@ def main() -> None:
                           warmup_lr_steps=args.warmup)
         model = Spidory(ModelConfig(seq_len=args.seq_len, use_experts=not args.plain, d_model=args.d_model,
                                     expert_dim=args.expert_dim, arch=args.arch,
-                                    active_experts=args.active_experts)).to(device)
+                                    active_experts=args.active_experts, route_per_loop=args.route_per_loop)).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     compile_for_speed(model)
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
