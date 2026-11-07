@@ -24,6 +24,20 @@ def pick_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def compile_for_speed(model: Spidory) -> None:
+    """Compiles each nGPT layer's forward, which fuses its many small operations.
+
+    Only forward functions are replaced, so checkpoints keep the same names.
+    """
+    if not getattr(model, "ngpt", False) or next(model.parameters()).device.type != "cuda":
+        return
+    from .ngpt import NBlock
+
+    for module in model.modules():
+        if isinstance(module, NBlock):
+            module.forward = torch.compile(module.forward, dynamic=True)
+
+
 def make_optimizer(model: Spidory, cfg: TrainConfig) -> torch.optim.AdamW:
     # nGPT keeps weights on the unit sphere, so it uses no weight decay.
     decay = 0.0 if getattr(model, "ngpt", False) else cfg.weight_decay
@@ -82,18 +96,29 @@ def train_steps(model, optimizer, corpus: Corpus, cfg: TrainConfig, start: int, 
         batch = corpus.train_batch(cfg.batch_size, focus, focus_share).to(device)
         for group in optimizer.param_groups:
             group["lr"] = lr_at(step, cfg)
-        with amp(device):
-            stage3 = step >= stage3_start(cfg)
-            if stage3 and model.cfg.use_experts and model.cfg.run_mode == "joint":
-                loss, parts = joint_step(model, batch[:, :-1], batch[:, 1:], cfg, tau_at(step, cfg))
-            else:
-                out = model(batch[:, :-1], ks=lambda experts: sample_ks(step, cfg, model, experts, batch.size(1) - 1),
-                            tau=tau_at(step, cfg), experts_on=step >= cfg.experts_from)
-                loss, parts = compute_loss(out, batch[:, 1:], cfg.balance_penalty)
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"loss became {loss.item()} at step {step}; stopping instead of wasting compute")
+        stage3 = step >= stage3_start(cfg)
+        joint = stage3 and model.cfg.use_experts and model.cfg.run_mode == "joint"
+        heavy = (cfg.stage1_steps + cfg.stage2_steps <= step < stage3_start(cfg)) or (
+            joint and model.cfg.neuron_train == "average")
+        # Memory-heavy steps keep several runs with gradients, so they go in pieces whose
+        # gradients add up to one update over the whole batch.
+        pieces = batch.split(max(1, -(-batch.size(0) // cfg.heavy_pieces))) if heavy else (batch,)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        totals: dict[str, float] = {}
+        for piece in pieces:
+            with amp(device):
+                if joint:
+                    loss, parts = joint_step(model, piece[:, :-1], piece[:, 1:], cfg, tau_at(step, cfg))
+                else:
+                    out = model(piece[:, :-1], ks=lambda experts: sample_ks(step, cfg, model, experts, piece.size(1) - 1),
+                                tau=tau_at(step, cfg), experts_on=step >= cfg.experts_from)
+                    loss, parts = compute_loss(out, piece[:, 1:], cfg.balance_penalty)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"loss became {loss.item()} at step {step}; stopping instead of wasting compute")
+            (loss * piece.size(0) / batch.size(0)).backward()
+            for key, value in parts.items():
+                totals[key] = totals.get(key, 0.0) + value * piece.size(0) / batch.size(0)
+        parts = totals
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         model.normalize_weights()
@@ -215,6 +240,7 @@ def main() -> None:
                                     expert_dim=args.expert_dim, arch=args.arch,
                                     active_experts=args.active_experts)).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
+    compile_for_speed(model)
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
     if start >= stop:
         return

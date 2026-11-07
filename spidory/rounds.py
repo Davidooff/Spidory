@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from .config import RoundConfig
 from .data import DATASETS, Corpus
 from .model import update_targets  # noqa: F401  (part of this module's public surface)
-from .train import heldout_loss, load, pick_device, save, set_rng_state, train_steps
+from .train import compile_for_speed, heldout_loss, load, pick_device, save, set_rng_state, train_steps
 
 
 @torch.no_grad()
@@ -196,6 +196,7 @@ def main() -> None:
         if model.cfg.run_mode == "joint":
             model.run_head_ready.fill_(True)
     print(f"{args.name}: {model.cfg.run_mode} runs, neuron {model.cfg.neuron}, {model.cfg.neuron_train}", flush=True)
+    compile_for_speed(model)
     rcfg = replace(RoundConfig(), steps=args.round_steps, passes=args.passes)
     corpus = Corpus(args.data, model.cfg.seq_len, seed=args.seed)
     resume = (0, 0)
