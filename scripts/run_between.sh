@@ -23,7 +23,7 @@ for ENTRY in "${VERSIONS[@]}"; do
   NAME=${ENTRY%%:*}; FLAGS=${ENTRY#*:}
   $PY -m spidory.train --name between_${NAME}_warm_s$SEED $FLAGS $COMMON || fail "$NAME training failed"
   $PY -m spidory.rounds --name neuron_between_${NAME}_s$SEED --warm between_${NAME}_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "$NAME rounds failed"
-  $PY -m spidory.evaluate --single neuron_between_${NAME}_s$SEED --out runs/results_between_${NAME}.json | tee runs/results_between_${NAME}.txt
+  $PY -m spidory.evaluate --single neuron_between_${NAME}_s$SEED --out runs/results_between_${NAME}.json > runs/results_between_${NAME}.txt 2>&1 || fail "$NAME evaluation failed"
 done
 cp runs/results_between_merge_nonorm.json runs/results_between.json
 touch runs/DONE
