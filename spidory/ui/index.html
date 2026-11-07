@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spidory Playground</title>
+<style>
+/* Layout: a prompt deck on top, then columns that each run one model and run setting. */
+:root {
+  --bg: #f3f1ec; --panel: #fbfaf7; --ink: #1f2328; --muted: #646b73; --line: #dcd8cf;
+  --accent: #2f5d62; --accent-ink: #ffffff; --chip: #ebe7de; --bad: #b3261e;
+  --run1: #cfe0ec; --run2: #bfe3d3; --run3: #f3dcae; --run4: #f2bfae;
+  --run1-ink: #24506e; --run2-ink: #1f5a42; --run3-ink: #7a5310; --run4-ink: #85301b;
+  --sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181b; --panel: #1c2024; --ink: #e7e5df; --muted: #9aa1a8; --line: #2e343a;
+    --accent: #7fb7b0; --accent-ink: #0f1a19; --chip: #262b30; --bad: #f2867c;
+    --run1: #1e3a4f; --run2: #1d4535; --run3: #4f3d18; --run4: #55271c;
+    --run1-ink: #a9d1ee; --run2-ink: #9fe0c1; --run3-ink: #f1cf8a; --run4-ink: #f5ab95;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+.wrap { max-width: 1500px; margin: 0 auto; padding: 20px max(16px, 3vw) 48px; display: grid; gap: 18px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+header p { margin: 0; color: var(--muted); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.deck { padding: 16px; display: grid; gap: 12px; }
+textarea { width: 100%; min-height: 84px; resize: vertical; padding: 10px 12px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--mono); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.chips button, .seg button, .ghost { border: 1px solid var(--line); background: var(--chip); color: var(--ink);
+  border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 13px; cursor: pointer; }
+.chips button:hover, .ghost:hover { border-color: var(--accent); }
+label.field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+input[type=number] { width: 72px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); font: inherit; }
+.primary { border: 0; background: var(--accent); color: var(--accent-ink); border-radius: 8px; padding: 8px 18px;
+  font: inherit; font-weight: 600; cursor: pointer; }
+.primary:disabled { opacity: .5; cursor: default; }
+.spacer { flex: 1; }
+.columns { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); }
+.col { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; }
+.col-head { padding: 12px 14px; display: grid; gap: 8px; border-bottom: 1px solid var(--line); }
+.col-head select { width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); font: inherit; font-weight: 600; }
+.seg { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.seg button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.seg button:disabled { opacity: .4; cursor: not-allowed; }
+.seg .sep { width: 1px; height: 18px; background: var(--line); }
+.mean { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.mean input { flex: 1; accent-color: var(--accent); }
+.note { color: var(--muted); font-size: 12px; }
+.x { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 0 2px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }
+.stats div { background: var(--panel); padding: 8px 10px; }
+.stats b { display: block; font: 600 16px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.stats span { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.out { padding: 12px 14px; font: 14px/1.9 var(--mono); white-space: pre-wrap; word-break: break-word; min-height: 160px; }
+.prompt-text { color: var(--muted); }
+.tok { border-radius: 3px; padding: 1px 0; cursor: pointer; position: relative; }
+.tok.r1 { background: var(--run1); color: var(--run1-ink); }
+.tok.r2 { background: var(--run2); color: var(--run2-ink); }
+.tok.r3 { background: var(--run3); color: var(--run3-ink); }
+.tok.r4 { background: var(--run4); color: var(--run4-ink); }
+.tok.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+.err { color: var(--bad); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+.legend i { display: inline-block; width: 26px; height: 14px; border-radius: 3px; vertical-align: -2px; margin-right: 4px; }
+.inspect { padding: 14px 16px; display: grid; gap: 10px; }
+.inspect h2 { margin: 0; font-size: 14px; font-weight: 650; }
+.inspect .empty { color: var(--muted); }
+.bars { display: grid; gap: 4px; grid-template-columns: auto 1fr auto; align-items: center; font: 12px var(--mono); }
+.bar { height: 10px; border-radius: 5px; background: var(--accent); min-width: 2px; }
+.split { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: no-preference) { .tok { transition: outline-color .15s; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Spidory playground</h1>
+    <p>One prompt, several models side by side. Each token is coloured by how many runs of the loop it used.</p>
+  </header>
+
+  <section class="card deck" aria-label="Prompt">
+    <textarea id="prompt" aria-label="Prompt">Q: a = 7, b = a + 5, c = b - 3. What is c?
+A:</textarea>
+    <div class="row chips" id="presets">
+      <button data-p="Q: a = 7, b = a + 5, c = b - 3. What is c?&#10;A:">Variables</button>
+      <button data-p="Q: What is 14 + 7 - 18 - 6 + 19 + 1 + 19 - 3 + 2?&#10;A:">Long chain</button>
+      <button data-p="Q: Compute (3 + (4 * 2)) - (9 - 5).&#10;A:">Brackets</button>
+      <button data-p="Once upon a time, there was a little fox who">Story</button>
+      <button data-p="def read_json(path):&#10;    &quot;&quot;&quot;Read a JSON file and return its data.&quot;&quot;&quot;&#10;">Code</button>
+      <button data-p="The Eiffel Tower is in Paris. It was built for the 1889 World's Fair.&#10;Q: When was the Eiffel Tower built?&#10;A:">Question</button>
+    </div>
+    <div class="row">
+      <label class="field">Tokens <input id="maxTokens" type="number" min="1" max="300" value="40"></label>
+      <label class="field">Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0"></label>
+      <label class="field">Seed <input id="seed" type="number" value="0"></label>
+      <span class="spacer"></span>
+      <button class="ghost" id="addCol">Add column</button>
+      <button class="ghost" id="sweep">Compare frozen 1 to 4</button>
+      <button class="primary" id="run">Run</button>
+      <button class="ghost" id="stop" disabled>Stop</button>
+    </div>
+    <div class="legend" aria-label="Run colours">
+      <span><i style="background:var(--run1)"></i>1 run</span>
+      <span><i style="background:var(--run2)"></i>2 runs</span>
+      <span><i style="background:var(--run3)"></i>3 runs</span>
+      <span><i style="background:var(--run4)"></i>4 runs</span>
+      <span>Click a token to inspect it.</span>
+    </div>
+  </section>
+
+  <section class="columns" id="columns" aria-label="Model columns"></section>
+
+  <section class="card inspect" aria-live="polite">
+    <h2>Token inspector</h2>
+    <div id="inspector" class="empty">Run a prompt, then click any generated token.</div>
+  </section>
+</div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+let models = [];
+let columns = [];
+let controller = null;
+let nextId = 1;
+
+const modelById = (id) => models.find((m) => m.id === id);
+
+function addColumn(model, setting) {
+  columns.push({ id: nextId++, model, setting, tokens: [], error: null, done: false });
+  render();
+}
+
+function settingLabel(s) {
+  if (s.kind === "neuron") return "neuron decides";
+  if (s.kind === "mean") return `average ${s.value} runs`;
+  return `frozen at ${s.value} run${s.value > 1 ? "s" : ""}`;
+}
+
+function stats(col) {
+  const t = col.tokens;
+  if (!t.length) return { n: "0", runs: "—", mflops: "—", ms: "—" };
+  const avg = (f) => t.reduce((a, x) => a + f(x), 0) / t.length;
+  return { n: String(t.length), runs: avg((x) => x.runs).toFixed(2),
+           mflops: avg((x) => x.mflops).toFixed(0), ms: avg((x) => x.ms).toFixed(0) };
+}
+
+function render() {
+  const holder = $("#columns");
+  holder.replaceChildren(...columns.map(renderColumn));
+}
+
+function renderColumn(col) {
+  const m = modelById(col.model);
+  const card = document.createElement("article");
+  card.className = "card col";
+
+  const head = document.createElement("div");
+  head.className = "col-head";
+  const top = document.createElement("div");
+  top.className = "row";
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Model");
+  models.forEach((x) => select.add(new Option(`${x.name} · ${x.experts ? x.experts + " experts" : "no experts"}`, x.id)));
+  select.value = col.model;
+  select.onchange = () => {
+    col.model = select.value;
+    const next = modelById(col.model);
+    if (col.setting.kind === "neuron" && !next.neuron) col.setting = { kind: "frozen", value: 2 };
+    if (col.setting.kind === "mean" && !next.experts) col.setting = { kind: "frozen", value: 2 };
+    render();
+  };
+  const close = document.createElement("button");
+  close.className = "x"; close.textContent = "×"; close.setAttribute("aria-label", "Remove column");
+  close.onclick = () => { columns = columns.filter((c) => c !== col); render(); };
+  select.style.flex = "1";
+  top.append(select, close);
+
+  const seg = document.createElement("div");
+  seg.className = "seg";
+  const button = (text, on, enabled, fn, title) => {
+    const b = document.createElement("button");
+    b.textContent = text; b.disabled = !enabled; if (on) b.classList.add("on");
+    if (title) b.title = title;
+    b.onclick = () => { fn(); render(); };
+    return b;
+  };
+  seg.append(button("Neuron decides", col.setting.kind === "neuron", m && m.neuron,
+                    () => (col.setting = { kind: "neuron" }), m && !m.neuron ? "This model has no trained run neuron" : ""));
+  const sep = document.createElement("span"); sep.className = "sep"; seg.append(sep);
+  const label = document.createElement("span"); label.className = "note"; label.textContent = "Freeze:"; seg.append(label);
+  for (let k = 1; k <= (m ? m.max_runs : 4); k++) {
+    seg.append(button(String(k), col.setting.kind === "frozen" && col.setting.value === k, true,
+                      () => (col.setting = { kind: "frozen", value: k })));
+  }
+  seg.append(button("Average", col.setting.kind === "mean", m && m.experts,
+                    () => (col.setting = { kind: "mean", value: 2.5 }), m && !m.experts ? "Average runs needs experts" : ""));
+
+  head.append(top, seg);
+  if (col.setting.kind === "mean") {
+    const row = document.createElement("label");
+    row.className = "mean";
+    const range = document.createElement("input");
+    range.type = "range"; range.min = "1"; range.max = String(m ? m.max_runs : 4); range.step = "0.25";
+    range.value = String(col.setting.value);
+    const out = document.createElement("b"); out.textContent = Number(col.setting.value).toFixed(2);
+    range.oninput = () => { col.setting.value = Number(range.value); out.textContent = Number(range.value).toFixed(2); };
+    row.append("Average runs", range, out);
+    head.append(row);
+  }
+  const note = document.createElement("div");
+  note.className = "note";
+  note.textContent = m ? `${settingLabel(col.setting)} · width ${m.width}, layers ${m.layers.join("/")} · ${m.note}` : "";
+  head.append(note);
+
+  const s = stats(col);
+  const statsEl = document.createElement("div");
+  statsEl.className = "stats";
+  [["Tokens", s.n], ["Avg runs", s.runs], ["MFLOPs/token", s.mflops], ["ms/token", s.ms]].forEach(([k, v]) => {
+    const d = document.createElement("div");
+    const b = document.createElement("b"); b.textContent = v;
+    const sp = document.createElement("span"); sp.textContent = k;
+    d.append(b, sp); statsEl.append(d);
+  });
+
+  const out = document.createElement("div");
+  out.className = "out";
+  const p = document.createElement("span"); p.className = "prompt-text"; p.textContent = $("#prompt").value;
+  out.append(p);
+  col.tokens.forEach((t, i) => {
+    const span = document.createElement("span");
+    span.className = `tok r${t.runs}`;
+    span.textContent = t.text;
+    span.tabIndex = 0;
+    span.title = `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? ", expert " + t.expert : ""}`;
+    const show = () => { document.querySelectorAll(".tok.sel").forEach((x) => x.classList.remove("sel")); span.classList.add("sel"); inspect(col, t, i); };
+    span.onclick = show;
+    span.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); show(); } };
+    out.append(span);
+  });
+  if (col.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = col.error; out.append(e); }
+
+  card.append(head, statsEl, out);
+  return card;
+}
+
+function bars(title, rows) {
+  const wrap = document.createElement("div");
+  const h = document.createElement("div"); h.className = "note"; h.textContent = title;
+  const grid = document.createElement("div"); grid.className = "bars";
+  rows.forEach(([name, value]) => {
+    const a = document.createElement("span"); a.textContent = name;
+    const track = document.createElement("div");
+    const bar = document.createElement("div"); bar.className = "bar"; bar.style.width = `${Math.max(1, value * 100)}%`;
+    track.append(bar);
+    const c = document.createElement("span"); c.textContent = `${(value * 100).toFixed(1)}%`;
+    grid.append(a, track, c);
+  });
+  wrap.append(h, grid);
+  return wrap;
+}
+
+function inspect(col, t, i) {
+  const m = modelById(col.model);
+  const box = $("#inspector");
+  box.className = "";
+  const head = document.createElement("p");
+  head.style.margin = "0";
+  head.textContent = `${m.name}, ${settingLabel(col.setting)}. Token ${i + 1}: ${JSON.stringify(t.text)}. ` +
+    `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? `, expert ${t.expert}` : ""}, ${t.mflops} MFLOPs, ${t.ms} ms.`;
+  const split = document.createElement("div"); split.className = "split";
+  split.append(bars("Most likely next tokens", t.top.map(([w, p]) => [JSON.stringify(w), p])));
+  if (t.neuron) split.append(bars("Run neuron: chance of each run count", t.neuron.map((p, k) => [`${k + 1} run${k ? "s" : ""}`, p])));
+  else { const n = document.createElement("div"); n.className = "note"; n.textContent = "No run neuron here: the run count is fixed by the setting."; split.append(n); }
+  box.replaceChildren(head, split);
+}
+
+async function run() {
+  if (!columns.length) return;
+  columns.forEach((c) => { c.tokens = []; c.error = null; c.done = false; });
+  render();
+  controller = new AbortController();
+  $("#run").disabled = true; $("#stop").disabled = false;
+  const body = { prompt: $("#prompt").value, max_tokens: Number($("#maxTokens").value),
+                 temperature: Number($("#temperature").value), seed: Number($("#seed").value),
+                 columns: columns.map((c) => ({ model: c.model, setting: c.setting })) };
+  let pending = false;
+  const schedule = () => { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } };
+  try {
+    const res = await fetch("/api/run", { method: "POST", body: JSON.stringify(body), signal: controller.signal });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, cut); buffer = buffer.slice(cut + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        const col = columns[ev.col];
+        if (ev.error && col) col.error = ev.error;
+        else if (ev.end && col) col.done = true;
+        else if (col && ev.text !== undefined) col.tokens.push(ev);
+        schedule();
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") columns.forEach((c) => (c.error = c.error || "The server stopped answering."));
+  }
+  $("#run").disabled = false; $("#stop").disabled = true;
+  render();
+}
+
+$("#run").onclick = run;
+$("#stop").onclick = () => controller && controller.abort();
+$("#presets").onclick = (e) => { const b = e.target.closest("button"); if (b) { $("#prompt").value = b.dataset.p; render(); } };
+$("#prompt").oninput = () => render();
+$("#addCol").onclick = () => addColumn(models[0].id, { kind: "frozen", value: 2 });
+$("#sweep").onclick = () => {
+  const base = columns.length ? columns[columns.length - 1].model : models[0].id;
+  for (let k = 1; k <= 4; k++) addColumn(base, { kind: "frozen", value: k });
+};
+
+(async () => {
+  models = await (await fetch("/api/models")).json();
+  if (!models.length) { $("#columns").textContent = "No trained models were found in runs/."; return; }
+  const neuron = models.find((m) => m.neuron);
+  const plain = models.find((m) => !m.experts);
+  if (neuron) { addColumn(neuron.id, { kind: "neuron" }); addColumn(neuron.id, { kind: "frozen", value: 1 }); addColumn(neuron.id, { kind: "frozen", value: 2 }); }
+  if (plain) addColumn(plain.id, { kind: "frozen", value: 2 });
+})();
+</script>
+</body>
+</html>
