@@ -1,5 +1,8 @@
 # Spidory training versions
 
+Short summary per version. The full record, with every model, test and problem, is in
+`docs/EXPERIMENT_LOG.md`.
+
 Each version below says how it trained and what it showed. All held-out numbers come from
 splits that training never saw.
 
