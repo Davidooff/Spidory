@@ -44,22 +44,26 @@ if [ "$CHECK_ONLY" != "--check" ]; then
   fi
 fi
 
+# Tell the machine's backup script that the laptop is copying, so it waits before ending the rental.
+( while true; do $SSH 'touch /workspace/Spidory/runs/LAPTOP_COPYING' >/dev/null 2>&1; sleep 300; done ) &
+COPY_SIGNAL=$!
+trap 'kill $COPY_SIGNAL 2>/dev/null' EXIT
 for attempt in 1 2 3 4 5; do
-  rsync -az --partial --timeout=120 -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
+  rsync -az --partial --timeout=120 --exclude LAPTOP_COPYING --exclude backup_to_hub.log -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
   say "copy attempt $attempt failed"
   [ "$attempt" = 5 ] && stop_keep "copy failed" 7
 done
 
-differences=$(rsync -anc --timeout=300 --itemize-changes -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" 2>&1)
+differences=$(rsync -anc --timeout=300 --exclude LAPTOP_COPYING --exclude backup_to_hub.log --itemize-changes -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" 2>&1)
 code=$?
 [ "$code" -eq 0 ] || stop_keep "verify failed with code $code" 8
 remote_files=
 for attempt in 1 2 3 4 5 6; do
-  remote_files=$($SSH 'find /workspace/Spidory/runs -type f | wc -l' 2>/dev/null | tail -1)
+  remote_files=$($SSH 'find /workspace/Spidory/runs -type f -not -name LAPTOP_COPYING -not -name backup_to_hub.log | wc -l' 2>/dev/null | tail -1)
   [ -n "$remote_files" ] && break
   sleep 10
 done
-local_files=$(find "$LOCAL" -type f | wc -l)
+local_files=$(find "$LOCAL" -type f -not -name LAPTOP_COPYING -not -name backup_to_hub.log | wc -l)
 say "remote files: $remote_files, local files: $local_files"
 if [ "$CHECK_ONLY" = "--check" ]; then
   say "check only, changed files: $(printf '%s' "$differences" | grep -c '^[>c]')"
