@@ -21,6 +21,8 @@ class ModelConfig:
     use_experts: bool = True
     between_layers: int = 0  # layers of the between block that runs between centre runs; 0 = none
     between_mode: str = "shared"  # "shared": one block for every gap; "per_gap": one block per gap
+    between_merge: bool = False  # the between block merges the input back in, learned, instead of N(s + x)
+    boundary_norm: bool = True  # normalize at loop boundaries; with nGPT, layers still normalize inside
     active_experts: int = 1  # experts applied per sequence, weighted by the router
     arch: str = "ngpt"  # "ngpt": Dory-style normalized blocks, SwiGLU, RoPE; "prenorm": the v1-v2 blocks
     run_mode: str = "table"  # "table": run counts from targets; "joint": the run neuron picks them

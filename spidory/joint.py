@@ -51,7 +51,7 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
             state = model._run_once(state, x.detach(), gates.detach())
             states.append(state)  # state after this run, before any between block
             if model.has_between and run < runs:
-                state = model._between(state, run)
+                state = model._between(state, run, x.detach())
         losses = torch.stack([_per_sequence_loss(model, states[k - 1], torch.full((size,), k, device=device),
                                                  experts, targets) for k in range(1, runs + 1)], 1)
 
@@ -60,7 +60,7 @@ def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: fl
         if runs == 1:
             return x
         before = torch.stack([x.detach()] + states[:-1], 1)[rows, ks - 1]
-        return torch.where((ks == 1)[:, None, None], x, model._enter_last(before, ks))
+        return torch.where((ks == 1)[:, None, None], x, model._enter_last(before, ks, x))
 
     def last_run(ks):
         return model._run_once(start_of(ks), x, gates)

@@ -57,7 +57,8 @@ class Registry:
                           "experts": cfg.n_experts if cfg.use_experts else 0, "max_runs": cfg.max_runs,
                           "neuron": cfg.use_experts and ready, "width": cfg.d_model,
                           "layers": [cfg.n_input, cfg.n_core, cfg.n_output],
-                          "between": {"layers": cfg.between_layers, "mode": cfg.between_mode},
+                          "between": {"layers": cfg.between_layers, "mode": cfg.between_mode,
+                                      "merge": cfg.between_merge, "boundary_norm": cfg.boundary_norm},
                           "mflops": {k: round(v * 1e6, 1) for k, v in tflops_by_k(cfg).items()}})
         return found
 

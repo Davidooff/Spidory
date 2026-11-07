@@ -22,7 +22,7 @@ def between_model(mode, layers=2, **extra):
 def count_between_calls(model):
     calls = []
     original = model._between
-    model._between = lambda s, gap: (calls.append((gap, torch.is_grad_enabled())), original(s, gap))[1]
+    model._between = lambda s, gap, x: (calls.append((gap, torch.is_grad_enabled())), original(s, gap, x))[1]
     return calls
 
 
@@ -41,9 +41,9 @@ def test_per_gap_has_its_own_blocks_and_shared_reuses_one():
     per_gap = between_model("per_gap").eval()
     with torch.no_grad():
         s = per_gap._unit(torch.randn(2, CFG.seq_len, CFG.d_model))
-        assert not torch.allclose(per_gap._between(s, 1), per_gap._between(s, 2), atol=1e-4)
+        assert not torch.allclose(per_gap._between(s, 1, s), per_gap._between(s, 2, s), atol=1e-4)
         shared = between_model("shared").eval()
-        assert torch.allclose(shared._between(s, 1), shared._between(s, 3))
+        assert torch.allclose(shared._between(s, 1, s), shared._between(s, 3, s))
 
 
 def test_no_between_block_changes_nothing():
