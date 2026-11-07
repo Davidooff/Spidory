@@ -30,7 +30,7 @@ def wake_experts(model):
             if hasattr(expert, "net"):
                 expert.net[-1].weight.normal_(std=0.1)
             else:
-                expert.alpha.value.normal_(std=0.5)  # nGPT experts start silent through alpha
+                expert.alpha.value.normal_(std=0.5 / expert.alpha.ratio)  # effective step about 0.5
         model.router[-1].weight.normal_(std=2.0)
 
 

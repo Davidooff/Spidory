@@ -29,10 +29,17 @@ def unit(x: torch.Tensor) -> torch.Tensor:
 class Scale(nn.Module):
     """A learned per-channel scale with nGPT's parametrization."""
 
-    def __init__(self, size: int, init: float, scale: float):
+    def __init__(self, size: int, init: float, scale: float, start: float | None = None):
+        """`start` sets a different first value: init stays the scale that sets how fast it learns.
+
+        A learned value must never use init = 0: the ratio would be 0, so it could never change.
+        """
         super().__init__()
+        if init == 0:
+            raise ValueError("init must be nonzero; use start=0 to begin at zero")
         self.ratio = init / scale
-        self.value = nn.Parameter(torch.full((size,), scale))
+        first = scale if start is None else start / self.ratio
+        self.value = nn.Parameter(torch.full((size,), first))
 
     def forward(self) -> torch.Tensor:
         return self.value * self.ratio
@@ -100,7 +107,9 @@ class NExpert(nn.Module):
         self.down = nn.Linear(width, d, bias=False)
         self.s_u = Scale(width, 1.0, 1.0)
         self.s_v = Scale(width, 1.0, 1.0)
-        self.alpha = Scale(d, 0.0, 1 / math.sqrt(d))
+        # Starts at 0 (silent), learning at nGPT's usual step-size rate. The old init = 0 left the
+        # ratio at 0, so experts could never switch on: found by an independent review.
+        self.alpha = Scale(d, 0.05, 1 / math.sqrt(d), start=0.0)
 
     def proposal(self, h: torch.Tensor) -> torch.Tensor:
         u, value = self.up(h).chunk(2, dim=-1)

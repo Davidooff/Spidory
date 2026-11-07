@@ -107,3 +107,28 @@ def test_ngpt_learns_a_tiny_batch():
         model.normalize_weights()
         first = first if first is not None else loss.item()
     assert loss.item() < 0.2 * first
+
+
+def test_silent_experts_wake_up_from_the_main_loss():
+    """Regression test: experts must get gradient and switch on, with no help from the test."""
+    torch.manual_seed(0)
+    model = Spidory(CFG).train()
+    assert all(float(e.alpha().abs().max()) == 0.0 for e in model.experts)  # silent at the start
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    for step in range(3):
+        batch = tokens(16)
+        out = model(batch[:, :-1], ks=2)
+        loss = F.cross_entropy(out["logits"].flatten(0, 1), batch[:, 1:].flatten())
+        optimizer.zero_grad()
+        loss.backward()
+        if step == 0:
+            assert any(e.alpha.value.grad.abs().sum() > 0 for e in model.experts)
+        optimizer.step()
+    assert any(float(e.alpha().abs().max()) > 0 for e in model.experts)
+    assert model.router[-1].weight.grad.abs().sum() > 0  # the router now learns from the loss
+    assert any(e.up.weight.grad is not None and e.up.weight.grad.abs().sum() > 0 for e in model.experts)
+
+
+def test_a_zero_learning_scale_is_refused():
+    with pytest.raises(ValueError):
+        Scale(4, init=0.0, scale=1.0)
