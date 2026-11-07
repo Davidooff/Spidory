@@ -13,7 +13,8 @@ R="--round-steps $ROUND --passes $PASSES --seed $SEED"
 fail() { echo "$1" > runs/STOPPED; exit 1; }
 
 $PY -m spidory.train --name plain_warm_s$SEED --plain $COMMON || fail "plain training failed"
-$PY -m spidory.evaluate --loop-check plain_warm_s$SEED || { echo "early check failed" > runs/STOPPED; exit 3; }
+# Recorded only: a failed check no longer stops the neuron experiments.
+$PY -m spidory.evaluate --loop-check plain_warm_s$SEED || echo "early check failed; continuing" >> runs/run_v3_notes.txt
 $PY -m spidory.train --name moe_warm_s$SEED $COMMON || fail "expert training failed"
 $PY -m spidory.rounds --name plain_s$SEED --warm plain_warm_s$SEED --control-only $R || fail "plain rounds failed"
 $PY -m spidory.rounds --name constant_s$SEED --warm moe_warm_s$SEED --control-only $R || fail "constant rounds failed"

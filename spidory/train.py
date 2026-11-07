@@ -98,10 +98,10 @@ def train_steps(model, optimizer, corpus: Corpus, cfg: TrainConfig, start: int, 
             group["lr"] = lr_at(step, cfg)
         stage3 = step >= stage3_start(cfg)
         joint = stage3 and model.cfg.use_experts and model.cfg.run_mode == "joint"
-        heavy = (cfg.stage1_steps + cfg.stage2_steps <= step < stage3_start(cfg)) or (
-            joint and model.cfg.neuron_train == "average")
-        # Memory-heavy steps keep several runs with gradients, so they go in pieces whose
-        # gradients add up to one update over the whole batch.
+        # The cycle stage and the "average" neuron keep several runs with gradients, so they go in
+        # pieces whose gradients add up to one update. Every model uses the same pieces from stage
+        # 2b on, so penalties (computed per piece) work the same way across variants.
+        heavy = step >= cfg.stage1_steps + cfg.stage2_steps
         pieces = batch.split(max(1, -(-batch.size(0) // cfg.heavy_pieces))) if heavy else (batch,)
         optimizer.zero_grad(set_to_none=True)
         totals: dict[str, float] = {}

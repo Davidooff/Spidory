@@ -30,7 +30,7 @@ def wake_experts(model):
             if hasattr(expert, "net"):
                 expert.net[-1].weight.normal_(std=0.1)
             else:
-                expert.alpha.value.normal_(std=0.5)  # nGPT experts start silent through alpha
+                expert.alpha.value.normal_(std=0.5 / expert.alpha.ratio)  # effective step about 0.5
         model.router[-1].weight.normal_(std=2.0)
 
 
@@ -415,7 +415,7 @@ def test_rejected_change_leaves_targets_and_equals_control(corpus, monkeypatch):
 
 def test_rules_need_every_seed_and_more_than_one():
     good = {"loops_pass": True, "experts_pass": True, "variable_pass": True, "learned_pass": True,
-            "specialised_pass": True,
+            "specialised_pass": True, "beats_best_fixed": True, "beats_per_dataset": True,
             "loops_gain": 0.02, "variable_gain_by_mean": {}}
     one = combine([{"seed": 0, "rules": good}])
     assert one["experts_pass"] and not one["confirmed"]
@@ -495,6 +495,30 @@ def test_training_stops_on_a_broken_loss(corpus, monkeypatch):
     monkeypatch.setattr(train, "compute_loss", lambda *a: (torch.tensor(float("nan"), requires_grad=True), {}))
     with pytest.raises(RuntimeError, match="loss became"):
         train.train_steps(model, make_optimizer(model, TCFG), corpus, TCFG, 0, 1)
+
+
+def test_paired_interval_finds_a_real_gain_and_rejects_noise():
+    from spidory.evaluate import paired_ci
+    torch.manual_seed(0)
+    base = {n: torch.rand(400) + 2 for n in ("a", "b")}
+    better = {n: v - 0.05 + 0.01 * torch.randn(400) for n, v in base.items()}
+    noise = {n: 0.2 * torch.randn(400) for n in base}
+    noisy = {n: v + noise[n] - noise[n].mean() for n, v in base.items()}  # no real difference
+    win = paired_ci(better, base)
+    assert win["ours_better"] and win["ci_high"] < 0 and win["difference"] == pytest.approx(-0.05, abs=0.005)
+    tie = paired_ci(noisy, base)
+    assert not tie["ours_better"] and tie["ci_low"] < 0 < tie["ci_high"]
+
+
+def test_policy_test_picks_fixed_counts_on_validation(corpus):
+    from spidory.evaluate import policy_test
+    model = Spidory(CFG)
+    wake_experts(model)
+    model.run_head_ready.fill_(True)
+    found = policy_test(model, corpus, 4)
+    assert found["best_fixed_k"] in (1, 2, 3, 4)
+    assert set(found["per_dataset_k"]) == set(DATASETS)
+    assert {"difference", "ci_low", "ci_high", "ours_better"} <= set(found["vs_per_dataset"])
 
 
 def test_plain_is_a_bit_smaller():

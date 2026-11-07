@@ -148,7 +148,66 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
         chosen = decisions(model, corpus, windows, learned=True)
         result["learned"] = score(learned=True) | chosen | {
             "tflops_per_token": average_tflops(cost, chosen["run_counts"])}
+        result["policy"] = policy_test(model, corpus, windows)
     return result
+
+
+@torch.no_grad()
+def sequence_losses(model, corpus: Corpus, split: str, windows: int, chunk: int = 32, **choice) -> dict:
+    """Mean next-token loss of each window, per dataset, on the real inference path."""
+    import torch.nn.functional as F
+
+    model.eval()
+    device = next(model.parameters()).device
+    found = {}
+    for name in DATASETS:
+        batch = corpus.fixed_windows(name, split, windows).to(device)
+        parts = []
+        for row in batch.split(chunk):
+            logits = model.infer(row[:, :-1], **choice)[0]
+            parts.append(F.cross_entropy(logits.flatten(0, 1).float(), row[:, 1:].flatten(),
+                                         reduction="none").view(row.size(0), -1).mean(1).cpu())
+        found[name] = torch.cat(parts)
+    return found
+
+
+def paired_ci(ours: dict, other: dict, boots: int = 2000, seed: int = 0) -> dict:
+    """Difference in mean loss (ours minus other), datasets weighted equally, with a 95% interval.
+
+    Sequences are resampled with replacement within each dataset, keeping each pair together.
+    Negative means ours has lower loss.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    diffs = {n: ours[n] - other[n] for n in ours}
+    point = sum(d.mean() for d in diffs.values()) / len(diffs)
+    samples = torch.zeros(boots)
+    for d in diffs.values():
+        idx = torch.randint(len(d), (boots, len(d)), generator=generator)
+        samples += d[idx].mean(1)
+    samples /= len(diffs)
+    low, high = torch.quantile(samples, torch.tensor([0.025, 0.975])).tolist()
+    return {"difference": round(float(point), 5), "ci_low": round(low, 5), "ci_high": round(high, 5),
+            "ours_better": high < 0}
+
+
+def policy_test(model, corpus: Corpus, windows: int) -> dict:
+    """Does the neuron's per-input choice beat fixed run counts?
+
+    The fixed choices are picked on validation data, then everything is compared on test data:
+    against the best single run count, and against the best run count per dataset. Beating the
+    per-dataset choice is what shows that choosing per input, not per dataset, helps.
+    """
+    val = {k: sequence_losses(model, corpus, "val", windows, k=k) for k in K_GRID}
+    test = {k: sequence_losses(model, corpus, "test", windows, k=k) for k in K_GRID}
+    learned = sequence_losses(model, corpus, "test", windows, learned=True)
+    val_mean = {k: sum(float(v.mean()) for v in val[k].values()) / len(DATASETS) for k in K_GRID}
+    best = min(K_GRID, key=lambda k: val_mean[k])
+    per_dataset = {n: min(K_GRID, key=lambda k: float(val[k][n].mean())) for n in DATASETS}
+    fixed = test[best]
+    by_dataset = {n: test[per_dataset[n]][n] for n in DATASETS}
+    return {"best_fixed_k": best, "per_dataset_k": per_dataset,
+            "per_dataset_mean_k": sum(per_dataset.values()) / len(DATASETS),
+            "vs_best_fixed": paired_ci(learned, fixed), "vs_per_dataset": paired_ci(learned, by_dataset)}
 
 
 def constant_at(result: dict, mean: float) -> dict[str, float]:
@@ -194,7 +253,11 @@ def verdict(plain: dict, constant: dict, variable: dict) -> dict:
         learned_gain = round((base - learned["mean_loss"]) / base, 4)
 
     info = variable["by_mean"]["2.5"]
-    return {"learned_gain": learned_gain, "learned_pass": bool(learned_gain is not None and learned_gain >= 0.01),
+    policy = variable.get("policy") or {}
+    return {"policy": policy,
+            "beats_best_fixed": bool(policy.get("vs_best_fixed", {}).get("ours_better")),
+            "beats_per_dataset": bool(policy.get("vs_per_dataset", {}).get("ours_better")),
+            "learned_gain": learned_gain, "learned_pass": bool(learned_gain is not None and learned_gain >= 0.01),
             "learned_mean_runs": learned["mean_runs"] if learned else None,
             "learned_run_counts": learned["run_counts"] if learned else None,
             "loops_gain": round(loops, 4), "loops_pass": loops >= 0.01,
@@ -206,7 +269,8 @@ def verdict(plain: dict, constant: dict, variable: dict) -> dict:
 
 def combine(reports: list[dict]) -> dict:
     """A rule holds only if every seed passes. One seed can never confirm a result."""
-    names = ("loops_pass", "experts_pass", "variable_pass", "learned_pass", "specialised_pass")
+    names = ("loops_pass", "experts_pass", "variable_pass", "learned_pass", "specialised_pass",
+             "beats_best_fixed", "beats_per_dataset")
     summary = {name: all(r["rules"][name] for r in reports) for name in names}
     summary["confirmed"] = len(reports) >= 2
     summary["seeds"] = [r["seed"] for r in reports]
