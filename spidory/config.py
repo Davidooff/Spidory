@@ -32,7 +32,7 @@ class TrainConfig:
     stage1_steps: int = 2100  # one run
     stage2_steps: int = 900  # sampled loops
     cycle_steps: int = 0  # stage 2b: run counts cycle 1, 2, 3, 4 across tokens
-    heavy_pieces: int = 4  # memory-heavy steps (cycle, "average" neuron) split the batch into this many pieces
+    heavy_pieces: int = 2  # memory-heavy steps (cycle, "average" neuron) split the batch into this many pieces
     steps: int = 5400  # whole schedule, including rounds
     lr: float = 3e-4
     weight_decay: float = 0.01
