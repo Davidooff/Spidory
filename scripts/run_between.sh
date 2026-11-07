@@ -12,10 +12,18 @@ COMMON="--stage1 $S1 --stage2 $S2 --cycle $CYCLE --total $TOTAL --batch-size $BA
 R="--round-steps $ROUND --passes $PASSES --seed $SEED"
 fail() { echo "$1" > runs/STOPPED; exit 1; }
 
-for MODE in shared per_gap; do
-  $PY -m spidory.train --name between_${MODE}_warm_s$SEED --between-mode $MODE $COMMON || fail "$MODE training failed"
-  $PY -m spidory.rounds --name neuron_between_${MODE}_s$SEED --warm between_${MODE}_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "$MODE rounds failed"
-  $PY -m spidory.evaluate --single neuron_between_${MODE}_s$SEED --out runs/results_between_${MODE}.json | tee runs/results_between_${MODE}.txt
+# name : extra training flags
+VERSIONS=(
+  "shared:--between-mode shared"
+  "per_gap:--between-mode per_gap"
+  "merge_norm:--between-mode per_gap --between-merge"
+  "merge_nonorm:--between-mode per_gap --between-merge --no-boundary-norm"
+)
+for ENTRY in "${VERSIONS[@]}"; do
+  NAME=${ENTRY%%:*}; FLAGS=${ENTRY#*:}
+  $PY -m spidory.train --name between_${NAME}_warm_s$SEED $FLAGS $COMMON || fail "$NAME training failed"
+  $PY -m spidory.rounds --name neuron_between_${NAME}_s$SEED --warm between_${NAME}_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "$NAME rounds failed"
+  $PY -m spidory.evaluate --single neuron_between_${NAME}_s$SEED --out runs/results_between_${NAME}.json | tee runs/results_between_${NAME}.txt
 done
-cp runs/results_between_per_gap.json runs/results_between.json
+cp runs/results_between_merge_nonorm.json runs/results_between.json
 touch runs/DONE
