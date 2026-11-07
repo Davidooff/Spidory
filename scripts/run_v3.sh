@@ -5,8 +5,9 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH=. OMP_NUM_THREADS=4
 PY=${PY:-/venv/main/bin/python}
 # Usage: scripts/run_v3.sh [seed]
-S1=24000; S2=24000; CYCLE=6000; ROUND=2400; PASSES=2; BATCH=64; SEED=${1:-0}
-TOTAL=$((S1 + S2 + CYCLE + ROUND * 4 * PASSES))
+# 3 datasets (story, maths, QA): 6 rounds of 3,200 steps keep stage 3 at 19,200 steps.
+S1=24000; S2=24000; CYCLE=6000; ROUND=3200; PASSES=2; BATCH=64; SEED=${1:-0}
+TOTAL=$((S1 + S2 + CYCLE + ROUND * 3 * PASSES))
 # nGPT blocks, SwiGLU and RoPE. Learning rate from a short laptop comparison (see TRAINING_VERSIONS.md).
 COMMON="--stage1 $S1 --stage2 $S2 --cycle $CYCLE --total $TOTAL --batch-size $BATCH --seed $SEED --arch ngpt --lr 6e-3 --warmup 1000"
 R="--round-steps $ROUND --passes $PASSES --seed $SEED"
@@ -24,5 +25,7 @@ $PY -m spidory.rounds --name neuron_net_average_s$SEED --warm moe_warm_s$SEED --
 $PY -m spidory.rounds --name neuron_net_mix_s$SEED --warm moe_warm_s$SEED --run-mode joint --neuron net --neuron-train mix $R || fail "neuron net mix failed"
 $PY -m spidory.train --name moe2_warm_s$SEED --active-experts 2 $COMMON || fail "two-expert training failed"
 $PY -m spidory.rounds --name neuron_net_sampled_top2_s$SEED --warm moe2_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "two-expert neuron failed"
-$PY -m spidory.evaluate --seeds $SEED --names plain constant neuron_net_sampled neuron_one_sampled neuron_net_average neuron_net_mix neuron_net_sampled_top2 --out runs/results_v3.json > runs/results_v3.txt 2>&1 || fail "evaluation failed"
+$PY -m spidory.train --name moe_perloop_warm_s$SEED --route-per-loop $COMMON || fail "per-loop expert training failed"
+$PY -m spidory.rounds --name neuron_net_sampled_perloop_s$SEED --warm moe_perloop_warm_s$SEED --run-mode joint --neuron net --neuron-train sampled $R || fail "per-loop neuron failed"
+$PY -m spidory.evaluate --seeds $SEED --names plain constant neuron_net_sampled neuron_one_sampled neuron_net_average neuron_net_mix neuron_net_sampled_top2 neuron_net_sampled_perloop --out runs/results_v3.json > runs/results_v3.txt 2>&1 || fail "evaluation failed"
 touch runs/DONE

@@ -245,7 +245,8 @@ def verdict(plain: dict, constant: dict, variable: dict) -> dict:
         wins[k] = {"datasets_won": sum(c["loss"][n] < p["loss"][n] * (1 - WIN_MARGIN) for n in DATASETS),
                    "maths_loss_gain": round((p["loss"]["maths"] - c["loss"]["maths"]) / p["loss"]["maths"], 4),
                    "maths_acc_gain": round(c["maths_accuracy"] - p["maths_accuracy"], 4)}
-    experts_pass = any(w["datasets_won"] >= 3 or w["maths_loss_gain"] >= 0.01 for k, w in wins.items() if k != "1")
+    majority = len(DATASETS) // 2 + 1
+    experts_pass = any(w["datasets_won"] >= majority or w["maths_loss_gain"] >= 0.01 for k, w in wins.items() if k != "1")
 
     gains = {}
     for mean in MEAN_GRID:

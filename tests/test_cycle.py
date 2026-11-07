@@ -69,7 +69,7 @@ def test_cycle_stage_trains_end_to_end_and_is_evaluated(corpus):  # noqa: F811
     model = Spidory(CFG)
     train_steps(model, make_optimizer(model, cfg), corpus, cfg, 0, 5)
     found = cycle_loss(model, corpus, 4)
-    assert set(found["loss"]) == {"story", "maths", "code", "qa"}
+    assert set(found["loss"]) == {"story", "maths", "qa"}
     assert len(found["loss_by_token_runs"]) == CFG.max_runs
 
 

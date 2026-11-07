@@ -15,7 +15,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-DATASETS = ("story", "maths", "code", "qa")
+# Every source the data builders write. Code is built but no longer trained or evaluated:
+# a model of this size is too small to learn code well.
+ALL_DATASETS = ("story", "maths", "code", "qa")
+DATASETS = ("story", "maths", "qa")  # what models train and are evaluated on
 SPLITS = ("train", "val", "test")
 MATH_URL = "https://storage.googleapis.com/mathematics-dataset/mathematics_dataset-v1.0.tar.gz"
 MATH_MODULES = (
@@ -176,13 +179,13 @@ def prepare(root: Path, vocab_size: int, max_chars: int, held_chars: int) -> Non
               for name, by_split in sources.items()}
 
     # Equal text from each source, so no dataset dominates the shared vocabulary.
-    sample = [d for name in DATASETS for d in _cap(capped[name]["train"], 3_000_000)]
+    sample = [d for name in ALL_DATASETS for d in _cap(capped[name]["train"], 3_000_000)]
     tok = train_tokenizer(sample, vocab_size)
     tok.save(str(root / "tokenizer.json"))
     eod = tok.token_to_id("[EOD]")
 
     stats: dict[str, dict[str, int]] = {}
-    for name in DATASETS:
+    for name in ALL_DATASETS:
         stats[name] = {}
         for split in SPLITS:
             ids: list[np.ndarray] = []
@@ -206,7 +209,7 @@ class Corpus:
         self.seq_len = seq_len
         self.rng = np.random.default_rng(seed)
         self.tokens = {(n, s): np.memmap(self.root / f"{n}.{s}.bin", dtype=np.uint16, mode="r")
-                       for n in DATASETS for s in SPLITS}
+                       for n in DATASETS for s in SPLITS}  # training datasets only
 
     def reseed(self, seed: int) -> None:
         self.rng = np.random.default_rng(seed)
