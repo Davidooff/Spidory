@@ -45,7 +45,9 @@ def decisions(model, corpus: Corpus, windows: int, mean_runs: float | None = Non
     for index, name in enumerate(DATASETS):
         batch = corpus.fixed_windows(name, "test", windows).to(device)
         chosen = [model.decide(row[:, :-1], mean_runs=mean_runs, learned=learned) for row in batch.split(32)]
-        e, r = torch.cat([c[0] for c in chosen]).cpu(), torch.cat([c[1] for c in chosen]).cpu()
+        # Per-token models choose per token: every token counts as one decision.
+        e = torch.cat([c[0].flatten() for c in chosen]).cpu()
+        r = torch.cat([c[1].flatten() for c in chosen]).cpu()
         experts.append(e), runs.append(r), labels.append(torch.full_like(e, index))
         per_dataset[name] = round(r.float().mean().item(), 3)
     experts, runs, labels = torch.cat(experts), torch.cat(runs), torch.cat(labels)

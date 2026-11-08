@@ -29,8 +29,8 @@ def measure_activation(model, corpus: Corpus, split: str, windows: int) -> dict[
     result = {}
     for name in DATASETS:
         batch = corpus.fixed_windows(name, split, windows).to(device)
-        choices = torch.cat([model.decide(row[:, :-1])[0] for row in batch.split(32)])
-        result[name] = torch.bincount(choices, minlength=model.cfg.n_experts).float().cpu() / windows
+        choices = torch.cat([model.decide(row[:, :-1])[0].flatten() for row in batch.split(32)])
+        result[name] = torch.bincount(choices, minlength=model.cfg.n_experts).float().cpu() / choices.numel()
     return result
 
 

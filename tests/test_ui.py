@@ -150,4 +150,4 @@ def test_per_token_cycle_gives_each_token_its_own_runs(registry):
     for col, top in ((0, 4), (1, 3), (2, 2)):
         runs = [e["runs"] for e in tokens if e["col"] == col]
         assert runs == [(prompt - 1 + i) % top + 1 for i in range(len(runs))]
-    assert all(e["expert"] == 1 and e["path"] == [1, 1, 1] for e in tokens if e["col"] == 1)
+    assert all(e["expert"] == 1 and e["path"] == [1] * e["runs"] for e in tokens if e["col"] == 1)

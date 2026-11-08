@@ -33,7 +33,9 @@ def tflops_by_k(cfg, upto: int | None = None) -> dict[int, float]:
     fixed = (cfg.n_input + cfg.n_output) * block + cfg.vocab_size * d * t
     per_run = cfg.n_core * block
     if cfg.use_experts:
-        per_run += (3 if ngpt else 2) * d * cfg.expert_dim * t
+        # Per-token routing computes every expert for every token here (they are small).
+        computed = cfg.n_experts if getattr(cfg, "route_per_token", False) else 1
+        per_run += computed * (3 if ngpt else 2) * d * cfg.expert_dim * t
     between = getattr(cfg, "between_layers", 0) * block  # runs between centre runs: k - 1 times
     return {k: 2 * (fixed + k * per_run + (k - 1) * between) / t / TERA for k in range(1, (upto or cfg.max_runs) + 1)}
 

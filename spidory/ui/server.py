@@ -178,10 +178,10 @@ def step(model: Spidory, ids: list[int], choice: dict, temperature: float, gener
             logits = model.infer_tokens(window, ks, expert=expert_lock)
             experts = (torch.tensor([expert_lock]) if expert_lock is not None
                        else model.decide(window, k=1)[0])
-            runs = ks[:, -1]
+            runs = ks[:, -1:]
         else:
             logits, experts, runs = model.infer(window, **choice)
-        path = [int(r[0]) for r in model._route_record]  # the expert used in each run
+        path = [int(r[0].flatten()[-1]) for r in model._route_record]  # the expert in each run, last token
     finally:
         model._route_record = None
     probs = F.softmax(logits[0, -1].float(), -1)
@@ -190,12 +190,16 @@ def step(model: Spidory, ids: list[int], choice: dict, temperature: float, gener
     else:
         token = int(torch.multinomial(F.softmax(logits[0, -1].float() / temperature, -1), 1, generator=generator))
     top = probs.topk(5)
-    expert = int(experts[0])
+    # Per-token models choose per token: show the choice for the last token, the one predicted from.
+    expert, run_count = int(experts[0].flatten()[-1]), int(runs[0].flatten()[-1])
+    path = path[:run_count]  # with per-token runs, later runs belong to other tokens
     neuron = None
     if model.cfg.use_experts and bool(model.run_head_ready) and "cycle" not in choice:
-        pooled = model._encode(window)[1]
+        h0, pooled = model._encode(window)
+        pooled = model._routing_input(h0, pooled)
+        pooled = pooled[:, -1] if model.cfg.route_per_token else pooled
         neuron = [round(float(p), 4) for p in F.softmax(model.run_logits(pooled)[0, max(expert, 0)].float(), -1)]
-    return {"token": token, "expert": expert, "runs": int(runs[0]), "neuron": neuron, "path": path,
+    return {"token": token, "expert": expert, "runs": run_count, "neuron": neuron, "path": path,
             "top": [[int(i), round(float(p), 4)] for p, i in zip(top.values, top.indices)]}
 
 

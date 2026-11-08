@@ -32,7 +32,76 @@ def _per_sequence_loss(model, h, ks, experts, targets):
                            reduction="none").view(targets.shape).mean(1)
 
 
+def _per_token_loss(model, h, ks, experts, targets):
+    logits = model._decode(h, ks, experts)
+    return F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), reduction="none").view(targets.shape)
+
+
+def joint_step_tokens(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: float):
+    """The joint step with one expert and one run count per token.
+
+    Every run passes all tokens, since attention needs them; a token's output is the state after
+    its own last run. The neuron learns from each token's losses at every run count, weighted by
+    its own probabilities, as in the per-sequence "sampled" way.
+    """
+    cfg = model.cfg
+    size, tokens, runs, device = inputs.size(0), inputs.size(1), cfg.max_runs, inputs.device
+    h0, _ = model._encode(inputs)
+    x = model._unit(h0)
+    model._route_tau = tau
+    model._loop_router_logits = []
+    router_logits = model.router(x)  # (batch, tokens, experts)
+    gates = model.route(router_logits, tau, True)
+    experts = gates.argmax(-1)
+    probs = F.softmax(model.run_probs_for(x, experts).float(), dim=-1)  # (batch, tokens, runs)
+
+    # Each token's loss at every run count, without gradients.
+    with torch.no_grad():
+        state, losses = x.detach(), []
+        for run in range(1, runs + 1):
+            state = model._run_once(state, x.detach(), gates.detach(), run)
+            losses.append(_per_token_loss(model, state, torch.full_like(experts, run), experts, targets))
+            if model.has_between and run < runs:
+                state = model._between(state, run, x.detach())
+        losses = torch.stack(losses, -1)
+
+    parts = {}
+    if cfg.neuron_train == "average":
+        # The model learns from every run count: each run's output, from detached inputs.
+        state, main = x, 0.0
+        for run in range(1, runs + 1):
+            entering = state if (model.has_between and run > 1) else state.detach()
+            new = model._run_once(entering, x, gates, run)
+            main = main + _per_token_loss(model, new, torch.full_like(experts, run), experts, targets).mean()
+            state = new.detach()
+            if model.has_between and run < runs:
+                state = model._between(state, run, x)
+        main = main / runs
+    else:
+        with torch.no_grad():
+            sampled = torch.multinomial(probs.reshape(-1, runs), 1).view(size, tokens) + 1
+            uniform = torch.randint(1, runs + 1, (size, tokens), device=device)
+            ks = torch.where(torch.rand(size, tokens, device=device) < tcfg.neuron_explore, uniform, sampled)
+        h = model._loop_tokens(x, gates, ks)
+        main = _per_token_loss(model, h, ks, experts, targets).mean()
+    loss = main
+    parts["ce"] = float(main)
+    neuron = neuron_objective(probs.reshape(-1, runs), losses.reshape(-1, runs))
+    loss = loss + tcfg.neuron_weight * neuron
+    parts["neuron"] = neuron.item()
+    penalty = run_penalty(probs, gates, model.run_targets)
+    routing, routing_parts = routing_losses(router_logits, gates, model._loop_router_logits, tcfg)
+    model._loop_router_logits = None
+    loss = loss + tcfg.run_penalty * penalty + routing
+    counts = torch.arange(1, runs + 1, device=device, dtype=probs.dtype)
+    parts.update(routing_parts)
+    parts.update(run=penalty.item(), mean_runs=float((probs.detach() * counts).sum(-1).mean()))
+    return loss, parts
+
+
 def joint_step(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, tau: float):
+    if model.cfg.route_per_token:
+        return joint_step_tokens(model, inputs, targets, tcfg, tau)
     cfg = model.cfg
     size, runs, device = inputs.size(0), cfg.max_runs, inputs.device
     rows = torch.arange(size, device=device)

@@ -25,6 +25,12 @@ class ModelConfig:
     boundary_norm: bool = True  # normalize at loop boundaries; with nGPT, layers still normalize inside
     active_experts: int = 1  # experts applied per sequence, weighted by the router
     route_per_loop: bool = False  # the router picks again before each run, from the current state
+    # Each run knows its number: u = N(a_k * s + b_k * x + e_k), per channel, starting as Dory's
+    # N(s + x). The expert and the between block get their own per-run vector too.
+    run_signal: bool = False
+    # Each token picks its own expert and run count from its own state, instead of one choice per
+    # sequence from the first `prefix` tokens.
+    route_per_token: bool = False
     arch: str = "ngpt"  # "ngpt": Dory-style normalized blocks, SwiGLU, RoPE; "prenorm": the v1-v2 blocks
     run_mode: str = "table"  # "table": run counts from targets; "joint": the run neuron picks them
     neuron: str = "net"  # "net": small network; "linear": one neuron per run count, per expert

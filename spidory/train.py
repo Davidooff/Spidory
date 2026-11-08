@@ -73,7 +73,7 @@ def stage3_start(cfg: TrainConfig) -> int:
 
 def sample_ks(step: int, cfg: TrainConfig, model: Spidory, experts: torch.Tensor, tokens: int = 0):
     """Run counts for one batch, by stage: per sequence, or per token in the cycle stage."""
-    size, device, top = experts.numel(), experts.device, model.cfg.max_runs
+    size, device, top = experts.size(0), experts.device, model.cfg.max_runs
     if step < cfg.stage1_steps:
         return torch.ones(size, dtype=torch.long, device=device)
     if step < cfg.stage1_steps + cfg.stage2_steps:
@@ -82,9 +82,11 @@ def sample_ks(step: int, cfg: TrainConfig, model: Spidory, experts: torch.Tensor
         return torch.randint(1, top + 1, (size,)).to(device)
     if step < stage3_start(cfg):
         return cycle_ks(size, tokens, top, device)
-    ks = model.pick_k(experts, model.run_targets, torch.rand(size).to(device))
-    explore = torch.rand(size).to(device) < cfg.explore
-    return torch.where(explore, torch.randint(1, top + 1, (size,)).to(device), ks)
+    # One run count per sequence, or per token when each token has its own expert.
+    shape = tuple(experts.shape)
+    ks = model.pick_k(experts, model.run_targets, torch.rand(shape).to(device))
+    explore = torch.rand(shape).to(device) < cfg.explore
+    return torch.where(explore, torch.randint(1, top + 1, shape).to(device), ks)
 
 
 def train_steps(model, optimizer, corpus: Corpus, cfg: TrainConfig, start: int, stop: int,
@@ -215,6 +217,10 @@ def main() -> None:
     parser.add_argument("--between-merge", action="store_true", help="merge the input inside the between block")
     parser.add_argument("--no-boundary-norm", action="store_true", help="no normalization at loop boundaries")
     parser.add_argument("--route-per-loop", action="store_true", help="the router picks again before each run")
+    parser.add_argument("--run-signal", action="store_true",
+                        help="each run knows its number: per-run mixing a*s + b*x + e, and run vectors")
+    parser.add_argument("--route-per-token", action="store_true",
+                        help="each token picks its own expert and run count")
     parser.add_argument("--lr", type=float, default=TrainConfig.lr)
     parser.add_argument("--warmup", type=int, default=TrainConfig.warmup_lr_steps)
     parser.add_argument("--seed", type=int, default=0)
@@ -246,7 +252,8 @@ def main() -> None:
                                     active_experts=args.active_experts, between_layers=args.between_layers,
                                     between_mode=args.between_mode, between_merge=args.between_merge,
                                     boundary_norm=not args.no_boundary_norm,
-                                    route_per_loop=args.route_per_loop)).to(device)
+                                    route_per_loop=args.route_per_loop, run_signal=args.run_signal,
+                                    route_per_token=args.route_per_token)).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     compile_for_speed(model)
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
