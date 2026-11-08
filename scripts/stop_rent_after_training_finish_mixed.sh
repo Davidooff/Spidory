@@ -21,7 +21,7 @@ if [ "$CHECK_ONLY" != "--check" ]; then
   failures=0; unknown=0
   for _ in $(seq 1 360); do  # 30 hours at most
     state=$($SSH 'cd /workspace/Spidory/runs
-      if pgrep -f "[r]un_mixed.sh|[b]uild_mixed_then_run.sh|[g]row_v4|[s]pidory\.(train|rounds|evaluate|clean_v5|mixed_data|grow_v4)" >/dev/null; then echo RUNNING
+      if pgrep -f "[r]un_mixed.sh|[b]uild_mixed_then_run.sh|[g]row_v4|[s]pidory\.(train|rounds|evaluate|clean_v5|mixed_data)" >/dev/null; then echo RUNNING
       elif [ -f DONE ]; then echo DONE
       elif [ -f STOPPED ]; then echo STOPPED
       elif [ -f LIMIT_REACHED ]; then echo LIMIT
