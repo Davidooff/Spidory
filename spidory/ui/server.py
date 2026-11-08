@@ -143,6 +143,11 @@ def expert_args(lock: dict | None, model: Spidory) -> dict:
 def setting_args(setting: dict, model: Spidory) -> dict:
     """Turns a column's run setting into inference arguments."""
     kind = setting.get("kind", "frozen")
+    if kind == "cycle":
+        top = int(setting.get("value", model.cfg.max_runs))
+        if not 2 <= top <= model.cfg.max_runs:
+            raise ValueError(f"a per-token cycle goes up to 2 to {model.cfg.max_runs} runs")
+        return {"cycle": top}
     if kind == "neuron":
         if not (model.cfg.use_experts and bool(model.run_head_ready)):
             raise ValueError("this model has no trained run neuron")
@@ -163,7 +168,19 @@ def step(model: Spidory, ids: list[int], choice: dict, temperature: float, gener
     window = torch.tensor([ids[-model.cfg.seq_len:]])
     model._route_record = []
     try:
-        logits, experts, runs = model.infer(window, **choice)
+        if "cycle" in choice:
+            # Per-token runs, as in training stage 2b: the token at position t gets t % top + 1
+            # runs, counted from the start of the text. All tokens pass through every run, since
+            # attention needs them, but each keeps the state of its own last run.
+            top, expert_lock = choice["cycle"], choice.get("expert")
+            start = max(0, len(ids) - model.cfg.seq_len)
+            ks = (torch.arange(start, start + window.size(1)) % top + 1)[None]
+            logits = model.infer_tokens(window, ks, expert=expert_lock)
+            experts = (torch.tensor([expert_lock]) if expert_lock is not None
+                       else model.decide(window, k=1)[0])
+            runs = ks[:, -1]
+        else:
+            logits, experts, runs = model.infer(window, **choice)
         path = [int(r[0]) for r in model._route_record]  # the expert used in each run
     finally:
         model._route_record = None
@@ -175,7 +192,7 @@ def step(model: Spidory, ids: list[int], choice: dict, temperature: float, gener
     top = probs.topk(5)
     expert = int(experts[0])
     neuron = None
-    if model.cfg.use_experts and bool(model.run_head_ready):
+    if model.cfg.use_experts and bool(model.run_head_ready) and "cycle" not in choice:
         pooled = model._encode(window)[1]
         neuron = [round(float(p), 4) for p in F.softmax(model.run_logits(pooled)[0, max(expert, 0)].float(), -1)]
     return {"token": token, "expert": expert, "runs": int(runs[0]), "neuron": neuron, "path": path,
@@ -214,8 +231,9 @@ def run_columns(registry: Registry, tok: Tokenizer, request: dict, emit) -> None
             column["ids"].append(found["token"])
             full = tok.decode(column["ids"][len(prompt):])
             piece, column["text"] = full[len(column["text"]):], full
+            paid = column["choice"].get("cycle", found["runs"])  # a cycle computes every run for all
             emit({"col": column["index"], "text": piece, "ms": round(seconds * 1000),
-                  "mflops": round(column["cost"][found["runs"]] * 1e6, 1),
+                  "mflops": round(column["cost"][paid] * 1e6, 1),
                   "top": [[tok.decode([i]), p] for i, p in found["top"]],
                   **{k: found[k] for k in ("expert", "runs", "neuron", "path")}})
     emit({"finished": True})

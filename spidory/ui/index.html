@@ -149,6 +149,7 @@ function settingLabel(s, e) {
   const who = e && e.kind === "fixed" ? `expert ${e.value} locked` : "router picks the expert";
   if (s.kind === "neuron") return `${who}, neuron picks the runs`;
   if (s.kind === "mean") return `${who}, average ${s.value} runs`;
+  if (s.kind === "cycle") return `${who}, runs change per token: 1 → ${s.value}, then again`;
   return `${who}, runs locked at ${s.value}`;
 }
 
@@ -220,6 +221,13 @@ function renderColumn(col) {
   }
   seg.append(button("Average", col.setting.kind === "mean", m && m.experts,
                     () => (col.setting = { kind: "mean", value: 2.5 }), m && !m.experts ? "Average runs needs experts" : ""));
+  const sep2 = document.createElement("span"); sep2.className = "sep"; seg.append(sep2);
+  const clabel = document.createElement("span"); clabel.className = "note"; clabel.textContent = "Per token:"; seg.append(clabel);
+  for (let top = 2; top <= (m ? m.max_runs : 4); top++) {
+    seg.append(button(`1→${top}`, col.setting.kind === "cycle" && col.setting.value === top, true,
+                      () => (col.setting = { kind: "cycle", value: top }),
+                      `Each next token gets one more run, back to 1 after ${top}: the training stage 2b loop`));
+  }
 
   const eseg = document.createElement("div");
   eseg.className = "seg";
@@ -306,7 +314,8 @@ function inspect(col, t, i) {
     `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? `, expert ${t.expert}` : ""}, ${t.mflops} MFLOPs, ${t.ms} ms.${path}`;
   const split = document.createElement("div"); split.className = "split";
   split.append(bars("Most likely next tokens", t.top.map(([w, p]) => [JSON.stringify(w), p])));
-  if (t.neuron) split.append(bars("Run neuron: chance of each run count", t.neuron.map((p, k) => [`${k + 1} run${k ? "s" : ""}`, p])));
+  if (col.setting.kind === "cycle") { const n = document.createElement("div"); n.className = "note"; n.textContent = "Per-token loop: every token passes through all runs (attention needs them), but each token keeps its own run count's state. MFLOPs show what was really computed."; split.append(n); }
+  else if (t.neuron) split.append(bars("Run neuron: chance of each run count", t.neuron.map((p, k) => [`${k + 1} run${k ? "s" : ""}`, p])));
   else { const n = document.createElement("div"); n.className = "note"; n.textContent = "No run neuron here: the run count is fixed by the setting."; split.append(n); }
   box.replaceChildren(head, split);
 }

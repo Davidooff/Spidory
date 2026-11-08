@@ -132,3 +132,22 @@ def test_discover_finds_runs_in_known_folders(tmp_path, corpus):  # noqa: F811
     assert [m["id"] for m in found] == ["remote_v3_s0/plain_s0", "remote_between/neuron_between_shared_s0"]
     assert found[0]["group"] == "v3, seed 0" and found[0]["params"] == model.num_params()
     assert len(found[0]["mflops"]) == server.EXTRA_RUNS
+
+
+def test_per_token_cycle_gives_each_token_its_own_runs(registry):
+    moe = registry.get("moe")
+    assert server.setting_args({"kind": "cycle", "value": 4}, moe) == {"cycle": 4}
+    with pytest.raises(ValueError):
+        server.setting_args({"kind": "cycle", "value": 9}, moe)
+    events = []
+    request = {"prompt": "hello", "max_tokens": 6,
+               "columns": [{"model": "moe", "setting": {"kind": "cycle", "value": 4}},
+                           {"model": "moe", "setting": {"kind": "cycle", "value": 3}, "experts": {"kind": "fixed", "value": 1}},
+                           {"model": "plain", "setting": {"kind": "cycle", "value": 2}}]}
+    server.run_columns(registry, FakeTok(), request, events.append)
+    tokens = [e for e in events if "text" in e]
+    prompt = len(FakeTok().encode("hello").ids)
+    for col, top in ((0, 4), (1, 3), (2, 2)):
+        runs = [e["runs"] for e in tokens if e["col"] == col]
+        assert runs == [(prompt - 1 + i) % top + 1 for i in range(len(runs))]
+    assert all(e["expert"] == 1 and e["path"] == [1, 1, 1] for e in tokens if e["col"] == 1)

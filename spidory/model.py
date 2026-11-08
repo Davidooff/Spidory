@@ -439,13 +439,25 @@ class Spidory(nn.Module):
         return logits, experts, ks
 
     @torch.no_grad()
-    def infer_tokens(self, tokens: torch.Tensor, ks: torch.Tensor):
-        """Inference with a run count per token, such as the training cycle."""
+    def infer_tokens(self, tokens: torch.Tensor, ks: torch.Tensor, expert: int | None = None):
+        """Inference with a run count per token, such as the training cycle.
+
+        `expert` locks every sequence to that expert in every run, instead of the router.
+        """
         was_training = self.training
         self.eval()
-        with amp(tokens.device):
-            logits = self(tokens, ks=ks)["logits"].float()
-        self.train(was_training)
+        gates = None
+        if expert is not None:
+            if not self.cfg.use_experts or not 0 <= expert < self.cfg.n_experts:
+                raise ValueError(f"expert must be 0 to {self.cfg.n_experts - 1}")
+            gates = F.one_hot(torch.full((tokens.size(0),), expert, device=tokens.device), self.cfg.n_experts).float()
+        self._route_locked = expert is not None
+        try:
+            with amp(tokens.device):
+                logits = self(tokens, ks=ks, gate_override=gates)["logits"].float()
+        finally:
+            self._route_locked = False
+            self.train(was_training)
         return logits
 
     def num_params(self) -> int:
