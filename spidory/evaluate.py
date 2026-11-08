@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import torch
@@ -99,6 +100,52 @@ def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, *
 
 
 @torch.no_grad()
+def generate_text(model, tok: Tokenizer, prompt: str, longest: int, done=None, **choice) -> str:
+    """Greedy continuation, until end of document, `longest` tokens, or done(text) is true."""
+    device = next(model.parameters()).device
+    eod = tok.token_to_id("[EOD]")
+    ids = tok.encode(prompt).ids
+    start, text = len(ids), ""
+    for _ in range(longest):
+        window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
+        next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
+        if next_id == eod:
+            break
+        ids.append(next_id)
+        text = tok.decode(ids[start:])
+        if done is not None and done(text):
+            break
+    return text
+
+
+def compose_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
+    """Share of "write a problem" tasks done as asked, checked by computing the reply."""
+    from .mixed_data import grade_compose
+
+    def done(text):  # a story problem ends with its answer line; the others with one line
+        return bool(re.search(r"A: -?\d+\s*$", text)) if "A: " in text else text.count("\n") >= 2
+
+    items = exam[:questions]
+    return sum(grade_compose(i, generate_text(model, tok, i["prompt"], 120, done, **choice)) for i in items) / max(1, len(items))
+
+
+def word_problem_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
+    """GSM8K or SVAMP: the stated answer, or the last number written, must match."""
+    from .mixed_data import last_number
+
+    def done(text):
+        return "answer is" in text.lower() and text.rstrip().endswith(".") or "\nQ:" in text
+
+    items = exam[:questions]
+    hits = 0
+    for item in items:
+        text = generate_text(model, tok, item["prompt"], 160, done, **choice).split("\nQ:")[0]
+        found = last_number(text)
+        hits += found is not None and found.rstrip("0").rstrip(".") == item["answer"].rstrip("0").rstrip(".")
+    return hits / max(1, len(items))
+
+
+@torch.no_grad()
 def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 160,
                      **choice) -> float:
     """Exact-answer rate when the model explains its steps first and ends with "The answer is N"."""
@@ -162,6 +209,13 @@ def extra_scores(model, corpus: Corpus, tok: Tokenizer, windows: int, questions:
     if "explain" in DATASETS and (root / "explain_exam.json").exists():
         exam = json.loads((root / "explain_exam.json").read_text())
         found["explain_accuracy"] = round(explain_accuracy(model, tok, exam, min(questions, 120), **choice), 4)
+    if "compose" in DATASETS and (root / "compose_exam.json").exists():
+        exam = json.loads((root / "compose_exam.json").read_text())
+        found["compose_accuracy"] = round(compose_accuracy(model, tok, exam, min(questions, 150), **choice), 4)
+    for name in ("gsm8k", "svamp"):
+        if "wordmath" in DATASETS and (root / f"{name}_exam.json").exists():
+            exam = json.loads((root / f"{name}_exam.json").read_text())
+            found[f"{name}_accuracy"] = round(word_problem_accuracy(model, tok, exam, min(questions, 150), **choice), 4)
     return found
 
 

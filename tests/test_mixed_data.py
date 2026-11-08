@@ -172,7 +172,12 @@ def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):
     _streams(tmp_path, tok)
     md.build_mixed(tmp_path, tok, _templates(), 0, 20_000, 6_000, exam_size=6)
     md.build_explain(tmp_path, tok, 0, 6_000, 3_000, exam_per_level=1)
-    names = ("story", "maths", "qa", "mixed", "explain")
+    md.build_compose(tmp_path, tok, _templates(), 0, 6_000, 3_000, exam_size=3)
+    for split in data.SPLITS:  # any token file will do for the loss; the exams are what is tested
+        (tmp_path / f"wordmath.{split}.bin").write_bytes((tmp_path / f"explain.{split}.bin").read_bytes())
+    for name in ("gsm8k", "svamp"):
+        (tmp_path / f"{name}_exam.json").write_text(json.dumps([{"prompt": "Q: What is 3 + 4?\nA:", "answer": "7"}]))
+    names = ("story", "maths", "qa", "mixed", "explain", "compose", "wordmath")
     monkeypatch.setattr(data, "DATASETS", names)
     monkeypatch.setattr(evaluate, "DATASETS", names)
     corpus = data.Corpus(tmp_path, CFG.seq_len)
@@ -182,10 +187,79 @@ def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):
     found = evaluate.extra_scores(model, corpus, tok, 4, 3, k=2)
     assert set(found["mixed_topics"]) == {"story", "maths", "qa"}
     assert all(np.isfinite(v) for v in found["mixed_topics"].values())
-    assert 0 <= found["mixed_accuracy"] <= 1 and 0 <= found["explain_accuracy"] <= 1
+    for key in ("mixed_accuracy", "explain_accuracy", "compose_accuracy", "gsm8k_accuracy", "svamp_accuracy"):
+        assert 0 <= found[key] <= 1, key
 
 
 def test_answer_reader():
     assert md.answer_of("3 + 4 = 7. The answer is 7.") == "7"
     assert md.answer_of("2 - 9 = -7. The answer is -7.") == "-7"
     assert md.answer_of("no answer here") is None
+
+
+def test_compose_replies_are_graded_by_computing():
+    rng = random.Random(1)
+    pools = em._pools()
+    questions = (i for b in generate("train", 50, 0, pools) for i in b)
+    templates = _templates()
+    for _ in range(60):
+        for item in (md.compose_story_item(rng.choice(templates), rng), md.compose_expression_item(rng),
+                     md.compose_question_item(next(questions), rng)):
+            assert md.grade_compose(item, item["reply"]), item
+    expression = {"kind": "*", "answer": 24, "count": 2}
+    assert md.grade_compose(expression, " 4 * 6 = 24") and md.grade_compose(expression, "3 * 8 = 24\nmore")
+    for wrong in ("4 * 5 = 24", "20 + 4 = 24", "4 * 6 = 25", "24", "2 * 3 * 4 = 24"):
+        assert not md.grade_compose(expression, wrong), wrong
+    story = {"kind": "story", "numbers": [7, 5], "answer": 12}
+    assert md.grade_compose(story, "Tom had 7 apples and got 5 more.\nQ: How many?\nA: 12")
+    assert not md.grade_compose(story, "Tom had 7 apples and got 4 more.\nQ: How many?\nA: 12")
+    assert not md.grade_compose(story, "Tom had 7 apples and got 5 more.\nQ: How many?\nA: 13")
+    question = {"kind": "question", "answer": 9}
+    assert md.grade_compose(question, "What is 4 + 5?\nAnswer: 9")
+    assert md.grade_compose(question, "a = 4, b = a + 5. What is b?")
+    assert not md.grade_compose(question, "What is 4 + 6?")
+
+
+def test_compose_dataset_and_exam(tmp_path, tok):
+    counts = md.build_compose(tmp_path, tok, _templates(), 0, 20_000, 3_000, exam_size=30)
+    assert counts["train"] >= 20_000
+    exam = json.loads((tmp_path / "compose_exam.json").read_text())
+    assert len(exam) == 30 and {e["kind"] for e in exam} >= {"story", "question"}
+    assert all("reply" not in e and e["prompt"].startswith("Task: ") for e in exam)
+    test_ids = {t["id"] for t in _templates() if md._split_of_id(t["id"]) == "test"}
+    assert test_ids  # story tasks in the exam come only from held-out templates
+
+
+class _Table:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def to_pylist(self):
+        return self.rows
+
+
+def test_word_problems_keep_exams_out_of_training(tmp_path, tok, monkeypatch):
+    shared = "A farmer had 41 sheep in a field near the old mill and sold some of them at the market"
+    tables = {
+        ("openai/gsm8k", "main/train-00000-of-00001.parquet"): [
+            {"question": "Ann has 3 cats and buys 2 more cats today. How many cats?", "answer": "3+2 = <<3+2=5>>5\n#### 5"},
+            {"question": shared + ". How many are left?", "answer": "41-10=<<41-10=31>>31\n#### 31"}],
+        ("openai/gsm8k", "main/test-00000-of-00001.parquet"): [
+            {"question": shared + ". How many did he sell?", "answer": "#### 10"}],
+        ("microsoft/orca-math-word-problems-200k", "data/train-00000-of-00001.parquet"): [
+            {"question": f"Problem number {i} about counting {i} boxes of pens on a long shelf.", "answer": f"There are {i} boxes."}
+            for i in range(300)],
+        ("ChilleD/SVAMP", "data/train-00000-of-00001.parquet"): [
+            {"Body": "There are 5 birds.", "Question": "How many birds?", "Answer": 5.0}],
+        ("ChilleD/SVAMP", "data/test-00000-of-00001.parquet"): [],
+    }
+    monkeypatch.setattr(data, "fetch_parquet", lambda repo, name: _Table(tables[repo, name]))
+    counts = md.build_wordmath(tmp_path, tok, 0)
+    assert counts["dropped_for_overlap"] == 1
+    text = tok.decode(np.fromfile(tmp_path / "wordmath.train.bin", dtype=np.uint16).tolist())
+    assert "old mill" not in text and "<<" not in text
+    gsm = json.loads((tmp_path / "gsm8k_exam.json").read_text())
+    assert gsm == [{"prompt": f"Q: {shared}. How many did he sell?\nA:", "answer": "10"}]
+    assert json.loads((tmp_path / "svamp_exam.json").read_text())[0]["answer"] == "5"
+    assert md.gsm8k_reply("2+2=<<2+2=4>>4\n#### 1,204") == ("2+2=4\nThe answer is 1204.", "1204")
+    assert md.last_number("So she has 12 left.") == "12" and md.last_number("The answer is 7. Then 9") == "7"

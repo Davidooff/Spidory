@@ -4,12 +4,13 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=. OMP_NUM_THREADS=4
-# Five datasets, each a fifth of every batch: story, maths, qa, mixed topics, explained maths.
-export SPIDORY_DATASETS=story,maths,qa,mixed,explain
+# Seven datasets, each a seventh of every batch: story, maths, qa, mixed topics, maths explained in
+# words, writing a problem when asked, and public word problems (Orca-Math and GSM8K train).
+export SPIDORY_DATASETS=story,maths,qa,mixed,explain,compose,wordmath
 PY=${PY:-/venv/main/bin/python}
-# 2 passes over 5 datasets: 10 rounds of 1,920 steps keep stage 3 at 19,200 steps, as in v3.
-S1=24000; S2=24000; CYCLE=6000; ROUND=1920; PASSES=2; BATCH=64; SEED=${1:-0}
-TOTAL=$((S1 + S2 + CYCLE + ROUND * 5 * PASSES))
+# 2 passes over 7 datasets: 14 rounds of 1,370 steps keep stage 3 near v3's 19,200 steps.
+S1=24000; S2=24000; CYCLE=6000; ROUND=1370; PASSES=2; BATCH=64; SEED=${1:-0}
+TOTAL=$((S1 + S2 + CYCLE + ROUND * 7 * PASSES))
 COMMON="--stage1 $S1 --stage2 $S2 --cycle $CYCLE --total $TOTAL --batch-size $BATCH --seed $SEED --arch ngpt --lr 6e-3 --warmup 1000"
 R="--round-steps $ROUND --passes $PASSES --seed $SEED"
 NEURON="--run-mode joint --neuron net --neuron-train sampled"
