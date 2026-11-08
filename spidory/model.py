@@ -136,8 +136,10 @@ class Spidory(nn.Module):
         nn.init.zeros_(self.run_embed.weight)
         if cfg.run_signal:
             # One row per run. They start at a = b = 1 and e = 0, so the loop starts as Dory's.
-            self.run_scale_state = nn.Parameter(torch.ones(cfg.max_runs, d))
-            self.run_scale_input = nn.Parameter(torch.ones(cfg.max_runs, d))
+            # With a merging between block the merge does the mixing, so a and b are not needed.
+            if not cfg.between_merge:
+                self.run_scale_state = nn.Parameter(torch.ones(cfg.max_runs, d))
+                self.run_scale_input = nn.Parameter(torch.ones(cfg.max_runs, d))
             self.run_signal_embed = nn.Parameter(torch.zeros(cfg.max_runs, d))
             if cfg.use_experts:
                 self.expert_run_embed = nn.Parameter(torch.zeros(cfg.max_runs, d))
@@ -235,13 +237,13 @@ class Spidory(nn.Module):
             h = block(h)
         if gates is not None:
             grad_path = self.training and torch.is_grad_enabled()
-            seen = h
-            if self.cfg.run_signal:  # the expert knows the run number too
-                seen = h + self._per_run(self.expert_run_embed, run, h)
-                seen = unit(seen) if self.ngpt else seen
             for e, expert in enumerate(self.experts):
                 weight = gates[..., e]  # one weight per sequence, or per token
                 if grad_path or weight.any():  # zero gates still carry gradient
+                    seen = h  # each expert reads the state left by the one before, as before
+                    if self.cfg.run_signal:  # the expert knows the run number too
+                        seen = h + self._per_run(self.expert_run_embed, run, h)
+                        seen = unit(seen) if self.ngpt else seen
                     w = weight[..., None] if weight.dim() == 2 else weight[:, None, None]
                     if self.ngpt:
                         step = w * expert.alpha()
@@ -417,9 +419,14 @@ class Spidory(nn.Module):
         return logits.gather(-2, index).squeeze(-2)
 
     def _token_noise(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Repeatable value in [0, 1) per token: the sequence's value, stepped along positions."""
-        steps = torch.arange(tokens.size(1), device=tokens.device) * 0.6180339887
-        return (self._row_noise(tokens)[:, None] + steps) % 1.0
+        """Repeatable value in [0, 1) per token, from that token and its position only.
+
+        It must not depend on later tokens, or a token's run count would depend on the text it
+        is predicting.
+        """
+        positions = torch.arange(tokens.size(1), device=tokens.device)
+        mixed = ((tokens.long() + 1) * 2654435761 + positions * 40503 + 12345) % (1 << 32)
+        return (mixed.float() / (1 << 32) + positions * 0.6180339887) % 1.0
 
     def _choose(self, tokens, pooled, k, mean_runs, learned=False, expert=None):
         cfg = self.cfg

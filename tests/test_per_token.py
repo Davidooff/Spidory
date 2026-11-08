@@ -139,3 +139,55 @@ def test_playground_shows_the_last_tokens_choice(tmp_path, corpus):  # noqa: F81
     assert not [e for e in events if "error" in e]
     made = [e for e in events if "text" in e]
     assert made and all(0 <= e["expert"] < CFG.n_experts and len(e["path"]) == e["runs"] for e in made)
+
+
+def test_compute_is_charged_for_later_tokens_too(corpus, monkeypatch):  # noqa: F811
+    """A token runs as often as any later token in its window, since they attend to it."""
+    model = woken()
+    fixed = torch.tensor([[1, 3, 2, 1, 4, 1]])
+
+    def decide(tokens, **_):
+        ks = fixed.repeat(tokens.size(0), (tokens.size(1) + 5) // 6)[:, : tokens.size(1)]
+        return torch.zeros_like(ks), ks
+    monkeypatch.setattr(model, "decide", decide)
+    found = decisions(model, corpus, 2, learned=True)
+    row = fixed.repeat(1, 8)[:, :CFG.seq_len]
+    paid = row.flip(-1).cummax(-1).values.flip(-1)
+    assert found["mean_runs"] == round(row.float().mean().item(), 3)
+    assert found["mean_runs_paid"] == round(paid.float().mean().item(), 3) > found["mean_runs"]
+    assert sum(found["run_counts"]) == paid.numel() * 2 * 3
+
+
+def test_average_run_choice_does_not_look_ahead():
+    model = woken()
+    batch = tokens(2)
+    changed = batch.clone()
+    changed[:, 20:] = (changed[:, 20:] + 5) % CFG.vocab_size
+    _, a = model.decide(batch, mean_runs=2.5)
+    _, b = model.decide(changed, mean_runs=2.5)
+    assert torch.equal(a[:, :20], b[:, :20])
+
+
+def test_loss_table_works_per_token(corpus):  # noqa: F811
+    model = woken(replace(TOKEN, run_mode="table"))
+    tables = rounds.loss_table(model, corpus, "val", 4)
+    assert all(t.shape == (CFG.n_experts, CFG.max_runs) for t in tables.values())
+
+
+def test_experts_read_the_state_left_by_the_one_before():
+    """Old models: each active expert reads the running state, as before per-token routing."""
+    from spidory.ngpt import unit
+    model = Spidory(replace(CFG, active_experts=2)).eval()
+    wake_experts(model)
+    s, x = torch.randn(2, CFG.seq_len, CFG.d_model), torch.randn(2, CFG.seq_len, CFG.d_model)
+    s, x = unit(s), unit(x)
+    gates = torch.tensor([[0.6, 0.4, 0.0, 0.0], [0.0, 0.3, 0.7, 0.0]])
+    out = model._run_once(s, x, gates, 1)
+    h = unit(s + x)
+    for block in model.core:
+        h = block(h)
+    for e, expert in enumerate(model.experts):
+        w = gates[:, e][:, None, None]
+        if w.any():
+            h = unit(h + w * expert.alpha() * (expert.proposal(h) - h))
+    assert torch.allclose(out, unit(h), atol=1e-6)

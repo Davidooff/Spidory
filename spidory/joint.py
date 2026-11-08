@@ -43,6 +43,10 @@ def joint_step_tokens(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, 
     Every run passes all tokens, since attention needs them; a token's output is the state after
     its own last run. The neuron learns from each token's losses at every run count, weighted by
     its own probabilities, as in the per-sequence "sampled" way.
+
+    Approximation: a token's loss at k is measured with every token at k. With per-token run
+    counts, the other tokens it attends to sit at their own counts instead. A review measured the
+    gap at about 10% of the spread between run counts on a random model.
     """
     cfg = model.cfg
     size, tokens, runs, device = inputs.size(0), inputs.size(1), cfg.max_runs, inputs.device
@@ -85,7 +89,7 @@ def joint_step_tokens(model, inputs: torch.Tensor, targets: torch.Tensor, tcfg, 
         h = model._loop_tokens(x, gates, ks)
         main = _per_token_loss(model, h, ks, experts, targets).mean()
     loss = main
-    parts["ce"] = float(main)
+    parts["ce"] = main.item()
     neuron = neuron_objective(probs.reshape(-1, runs), losses.reshape(-1, runs))
     loss = loss + tcfg.neuron_weight * neuron
     parts["neuron"] = neuron.item()

@@ -26,13 +26,24 @@ def mutual_information(counts: torch.Tensor) -> float:
     return float((joint[mask] * (joint[mask] / (rows @ cols)[mask]).log2()).sum())
 
 
-def shuffled_information(choices: torch.Tensor, labels: torch.Tensor, n_experts: int, tries: int = 50) -> float:
-    """What mutual information looks like by chance at this sample size."""
+def shuffled_information(choices: torch.Tensor, labels: torch.Tensor, n_experts: int, tries: int = 50,
+                         groups: torch.Tensor | None = None) -> float:
+    """What mutual information looks like by chance at this sample size.
+
+    With `groups` (the window each decision came from), labels are shuffled between windows, not
+    between tokens: tokens of one window are strongly alike, so shuffling them one by one would
+    make chance look too small.
+    """
     found = []
     for seed in range(tries):
-        order = torch.randperm(len(labels), generator=torch.Generator().manual_seed(seed))
+        generator = torch.Generator().manual_seed(seed)
+        if groups is None:
+            shuffled = labels[torch.randperm(len(labels), generator=generator)]
+        else:
+            per_group = torch.zeros(int(groups.max()) + 1, dtype=labels.dtype).scatter_(0, groups, labels)
+            shuffled = per_group[torch.randperm(len(per_group), generator=generator)][groups]
         counts = torch.zeros(int(labels.max()) + 1, n_experts)
-        counts.index_put_((labels[order], choices), torch.ones(len(labels)), accumulate=True)
+        counts.index_put_((shuffled, choices), torch.ones(len(labels)), accumulate=True)
         found.append(mutual_information(counts))
     return sum(found) / tries
 
@@ -41,26 +52,34 @@ def shuffled_information(choices: torch.Tensor, labels: torch.Tensor, n_experts:
 def decisions(model, corpus: Corpus, windows: int, mean_runs: float | None = None, learned: bool = False) -> dict:
     model.eval()
     device = next(model.parameters()).device
-    experts, runs, labels = [], [], []
+    experts, runs, paid, labels, groups = [], [], [], [], []
     per_dataset = {}
     for index, name in enumerate(DATASETS):
         batch = corpus.fixed_windows(name, "test", windows).to(device)
         chosen = [model.decide(row[:, :-1], mean_runs=mean_runs, learned=learned) for row in batch.split(32)]
-        # Per-token models choose per token: every token counts as one decision.
+        # Per-token models choose per token: every token counts as one decision. Compute is
+        # charged honestly: a token must run as many times as any later token in its window,
+        # because later tokens attend to its state at their own runs.
+        ks = [c[1] for c in chosen]
+        charged = [k.flip(-1).cummax(-1).values.flip(-1) if k.dim() == 2 else k for k in ks]
         e = torch.cat([c[0].flatten() for c in chosen]).cpu()
-        r = torch.cat([c[1].flatten() for c in chosen]).cpu()
+        r = torch.cat([k.flatten() for k in ks]).cpu()
         experts.append(e), runs.append(r), labels.append(torch.full_like(e, index))
+        paid.append(torch.cat([k.flatten() for k in charged]).cpu())
+        per_window = e.numel() // windows
+        groups.append(torch.arange(windows).repeat_interleave(per_window) + index * windows)
         per_dataset[name] = round(r.float().mean().item(), 3)
-    experts, runs, labels = torch.cat(experts), torch.cat(runs), torch.cat(labels)
+    experts, runs, paid, labels, groups = (torch.cat(x) for x in (experts, runs, paid, labels, groups))
     result = {"mean_runs": round(runs.float().mean().item(), 3), "mean_runs_by_dataset": per_dataset,
-              "run_counts": torch.bincount(runs, minlength=model.cfg.max_runs + 1)[1:].tolist()}
+              "mean_runs_paid": round(paid.float().mean().item(), 3),
+              "run_counts": torch.bincount(paid, minlength=model.cfg.max_runs + 1)[1:].tolist()}
     if model.cfg.use_experts:
         n = model.cfg.n_experts
         counts = torch.zeros(len(DATASETS), n)
         counts.index_put_((labels, experts), torch.ones(len(labels)), accumulate=True)
         result.update(activation={name: counts[i].int().tolist() for i, name in enumerate(DATASETS)},
                       mutual_info_bits=round(mutual_information(counts), 4),
-                      mutual_info_shuffled=round(shuffled_information(experts, labels, n), 4),
+                      mutual_info_shuffled=round(shuffled_information(experts, labels, n, groups=groups), 4),
                       mean_runs_by_expert=[round(runs[experts == e].float().mean().item(), 3)
                                            if (experts == e).any() else None for e in range(n)])
     return result

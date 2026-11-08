@@ -49,10 +49,13 @@ def loss_table(model, corpus: Corpus, split: str, windows: int) -> dict[str, tor
             for k in range(1, cfg.max_runs + 1):
                 logits, experts, _ = model.infer(row[:, :-1], k=k)
                 each = F.cross_entropy(logits.flatten(0, 1).float(), row[:, 1:].flatten(),
-                                       reduction="none").view(row.size(0), -1).mean(1).cpu()
-                total[:, k - 1].index_add_(0, experts.cpu(), each)
+                                       reduction="none").view(row.size(0), -1)
+                # Per-token models choose an expert per token; others one per sequence.
+                each = (each if experts.dim() == 2 else each.mean(1)).flatten().cpu()
+                chosen = experts.flatten().cpu()
+                total[:, k - 1].index_add_(0, chosen, each)
                 if k == 1:
-                    seen.index_add_(0, experts.cpu(), torch.ones(len(each)))
+                    seen.index_add_(0, chosen, torch.ones(len(each)))
         tables[name] = total / seen[:, None]
     return tables
 
