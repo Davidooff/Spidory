@@ -23,8 +23,8 @@ from pathlib import Path
 PATTERNS = ("*.json", "*.jsonl", "*.log", "*.txt", "*/last.pt", "DONE", "STOPPED", "LIMIT_REACHED")
 CHECKPOINTS = ("*/last.pt",)
 ENDED = ("DONE", "STOPPED", "LIMIT_REACHED")
-RUNNING = (r"[r]un_v3.sh|[r]un_between.sh|[b]uild_then_between.sh|"
-           r"[s]pidory\.(train|rounds|evaluate|clean_v5|grow_v4)")
+RUNNING = (r"[r]un_v3.sh|[r]un_between.sh|[b]uild_then_between.sh|[r]un_mixed.sh|[b]uild_mixed_then_run.sh|"
+           r"[s]pidory\.(train|rounds|evaluate|clean_v5|grow_v4|mixed_data)")
 LAPTOP_COPYING = "LAPTOP_COPYING"  # the laptop refreshes this file while it copies
 
 
