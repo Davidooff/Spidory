@@ -167,6 +167,7 @@ class Spidory(nn.Module):
     _route_tau = 0.3  # set per step in training
     _loop_router_logits: list | None = None  # per-loop routing with gradients, for the routing losses
     _route_record: list | None = None  # when a list, each run's chosen experts are appended
+    _route_locked = False  # when True, per-loop routing keeps the experts chosen at the start
 
     def _route_from_state(self, s: torch.Tensor, gates: torch.Tensor, run) -> torch.Tensor:
         """With route_per_loop, runs after the first pick experts from the state entering them."""
@@ -186,7 +187,7 @@ class Spidory(nn.Module):
         With a merging between block, the input was already merged in, so u = s.
         `run` (an int, or one value per row) counts from 1; per-loop routing uses it.
         """
-        if gates is not None and self.cfg.route_per_loop:
+        if gates is not None and self.cfg.route_per_loop and not self._route_locked:
             gates = self._route_from_state(s, gates, run)
         if gates is not None and self._route_record is not None:
             self._route_record.append(gates.argmax(-1).detach().cpu())
@@ -210,7 +211,7 @@ class Spidory(nn.Module):
 
     def _decode(self, h: torch.Tensor, ks: torch.Tensor, experts: torch.Tensor) -> torch.Tensor:
         """The output block is told the run count and which expert ran."""
-        runs = self.run_embed(ks)
+        runs = self.run_embed(ks.clamp(max=self.cfg.max_runs))  # beyond training: the last count
         h = h + (runs if ks.dim() == 2 else runs[:, None])  # one count per token, or per sequence
         if self.cfg.use_experts and (experts >= 0).all():
             h = h + self.expert_embed(experts)[:, None]
@@ -231,7 +232,7 @@ class Spidory(nn.Module):
 
         With between_merge, it first merges state and input with learned weights.
         """
-        index = 0 if self.cfg.between_mode == "shared" else gap - 1
+        index = 0 if self.cfg.between_mode == "shared" else min(gap, self.cfg.max_runs - 1) - 1
         if self.cfg.between_merge:
             s = self.merge_state[index](s) + self.merge_input[index](x)
             if self.cfg.boundary_norm:
@@ -363,11 +364,16 @@ class Spidory(nn.Module):
         head = self.run_neuron if self.cfg.neuron == "linear" else self.run_head
         return head(pooled).view(pooled.size(0), self.cfg.n_experts, self.cfg.max_runs)
 
-    def _choose(self, tokens, pooled, k, mean_runs, learned=False):
+    def _choose(self, tokens, pooled, k, mean_runs, learned=False, expert=None):
         cfg = self.cfg
         size = tokens.size(0)
-        experts = (self.router(pooled).argmax(-1) if cfg.use_experts
-                   else torch.full((size,), -1, device=tokens.device))
+        if expert is not None:
+            if not cfg.use_experts or not 0 <= expert < cfg.n_experts:
+                raise ValueError(f"expert must be 0 to {cfg.n_experts - 1}")
+            experts = torch.full((size,), expert, device=tokens.device)
+        else:
+            experts = (self.router(pooled).argmax(-1) if cfg.use_experts
+                       else torch.full((size,), -1, device=tokens.device))
         if k is not None:
             return experts, torch.full((size,), k, device=tokens.device)
         if learned and cfg.neuron_train == "mix":
@@ -388,17 +394,27 @@ class Spidory(nn.Module):
 
     @torch.no_grad()
     def infer(self, tokens: torch.Tensor, k: int | None = None, mean_runs: float | None = None,
-              learned: bool = False):
-        """Real inference: stops at the chosen run count. Groups sequences by top expert and count."""
+              learned: bool = False, expert: int | None = None):
+        """Real inference: stops at the chosen run count. Groups sequences by top expert and count.
+
+        `expert` locks every sequence to that one expert, in every run, instead of the router.
+        `k` may go past max_runs to test extrapolation: later runs reuse the last run embedding
+        and, per gap, the last between block.
+        """
         was_training = self.training
         self.eval()
         device = tokens.device
         logits = torch.empty(*tokens.shape, self.cfg.vocab_size, device=device)
         with amp(device):
             h0, pooled = self._encode(tokens)
-            experts, ks = self._choose(tokens, pooled, k, mean_runs, learned)
-            all_gates = (self.route(self.router(pooled), self.route_tau, False).to(h0.dtype)
-                         if self.cfg.use_experts else None)
+            experts, ks = self._choose(tokens, pooled, k, mean_runs, learned, expert)
+            if expert is not None:
+                all_gates = F.one_hot(experts, self.cfg.n_experts).to(h0.dtype)
+            elif self.cfg.use_experts:
+                all_gates = self.route(self.router(pooled), self.route_tau, False).to(h0.dtype)
+            else:
+                all_gates = None
+            self._route_locked = expert is not None
             mix = learned and self.cfg.neuron_train == "mix" and k is None and mean_runs is None
             for expert, count in torch.stack([experts, ks], 1).unique(dim=0).tolist():
                 rows = ((experts == expert) & (ks == count)).nonzero().squeeze(1)
@@ -418,6 +434,7 @@ class Spidory(nn.Module):
                     h = (probs[:, :, None, None] * torch.stack(states, 1)).sum(1)
                     shown = probs.argmax(-1) + 1
                 logits[rows] = self._decode(h, shown, experts[rows]).to(logits.dtype)
+        self._route_locked = False
         self.train(was_training)
         return logits, experts, ks
 

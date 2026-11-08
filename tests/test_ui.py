@@ -37,7 +37,7 @@ def registry(tmp_path, corpus):  # noqa: F811
 def test_models_are_described(registry):
     found = {m["id"]: m for m in registry.describe()}
     assert found["moe"]["neuron"] and not found["plain"]["neuron"]
-    assert found["plain"]["experts"] == 0 and len(found["moe"]["mflops"]) == CFG.max_runs
+    assert found["plain"]["experts"] == 0 and len(found["moe"]["mflops"]) == server.EXTRA_RUNS
 
 
 def test_settings_map_to_inference_choices(registry):
@@ -73,3 +73,62 @@ def test_neuron_setting_reports_its_own_choice(registry):
     server.run_columns(registry, FakeTok(), request, events.append)
     for e in (e for e in events if "text" in e):
         assert e["runs"] == max(range(len(e["neuron"])), key=lambda i: e["neuron"][i]) + 1
+
+
+def test_expert_lock_runs_that_expert_in_every_run(registry):
+    moe = registry.get("moe")
+    assert server.expert_args({"kind": "router"}, moe) == {}
+    assert server.expert_args({"kind": "fixed", "value": 2}, moe) == {"expert": 2}
+    with pytest.raises(ValueError):
+        server.expert_args({"kind": "fixed", "value": CFG.n_experts}, moe)
+    with pytest.raises(ValueError):
+        server.expert_args({"kind": "fixed", "value": 0}, registry.get("plain"))
+    events = []
+    request = {"prompt": "hello", "max_tokens": 4,
+               "columns": [{"model": "moe", "setting": {"kind": "frozen", "value": 3},
+                            "experts": {"kind": "fixed", "value": e}} for e in range(CFG.n_experts)]}
+    server.run_columns(registry, FakeTok(), request, events.append)
+    for e in (e for e in events if "text" in e):
+        assert e["expert"] == e["col"] and e["path"] == [e["col"]] * 3
+
+
+def test_locked_expert_differs_from_router_output():
+    model = Spidory(CFG).eval()
+    wake_experts(model)
+    tokens = torch.randint(0, CFG.vocab_size, (1, 40))
+    chosen = int(model.infer(tokens, k=2)[1][0])
+    other = (chosen + 1) % CFG.n_experts
+    same, _, _ = model.infer(tokens, k=2, expert=chosen)
+    assert torch.allclose(same, model.infer(tokens, k=2)[0])
+    assert not torch.allclose(model.infer(tokens, k=2, expert=other)[0], same)
+
+
+def test_per_loop_routing_stays_locked():
+    model = Spidory(replace(CFG, route_per_loop=True)).eval()
+    wake_experts(model)
+    model._route_record = []
+    model.infer(torch.randint(0, CFG.vocab_size, (1, 40)), k=4, expert=1)
+    assert [int(r[0]) for r in model._route_record] == [1, 1, 1, 1]
+    assert not model._route_locked
+
+
+def test_runs_past_training_maximum(registry):
+    for cfg in (CFG, replace(CFG, between_layers=1, between_mode="per_gap")):
+        model = Spidory(cfg).eval()
+        logits, _, ks = model.infer(torch.randint(0, cfg.vocab_size, (1, 20)), k=cfg.max_runs + 2)
+        assert int(ks[0]) == cfg.max_runs + 2 and torch.isfinite(logits).all()
+    events = []
+    request = {"prompt": "hi", "max_tokens": 2,
+               "columns": [{"model": "moe", "setting": {"kind": "frozen", "value": server.EXTRA_RUNS}}]}
+    server.run_columns(registry, FakeTok(), request, events.append)
+    assert all(e["runs"] == server.EXTRA_RUNS and e["mflops"] > 0 for e in events if "text" in e)
+
+
+def test_discover_finds_runs_in_known_folders(tmp_path, corpus):  # noqa: F811
+    model = Spidory(CFG)
+    for where in ("remote_v3_s0/plain_s0", "remote_between/neuron_between_shared_s0", "elsewhere/x"):
+        save(tmp_path / "runs" / where / "last.pt", model, make_optimizer(model, TCFG), 1, TCFG, corpus)
+    found = server.Registry(tmp_path).describe()
+    assert [m["id"] for m in found] == ["remote_v3_s0/plain_s0", "remote_between/neuron_between_shared_s0"]
+    assert found[0]["group"] == "v3, seed 0" and found[0]["params"] == model.num_params()
+    assert len(found[0]["mflops"]) == server.EXTRA_RUNS

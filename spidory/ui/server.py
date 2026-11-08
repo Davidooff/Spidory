@@ -21,16 +21,12 @@ from ..flops import tflops_by_k
 from ..model import Spidory
 
 PAGE = Path(__file__).with_name("index.html")
-CATALOG = [
-    {"id": "big-100m", "name": "Experts 100M", "path": "runs/remote_100m/big_s0/last.pt",
-     "note": "v2-100M. Run neuron trained after the model, on a frozen copy (not the joint design)."},
-    {"id": "plain-24m-v3", "name": "Plain 24M, data v2", "path": "runs/remote_v3/plain_warm_s0/last.pt",
-     "note": "v3 Plain after stage 2. Harder maths and bigger QA. No experts, no neuron."},
-    {"id": "plain-24m-v2", "name": "Plain 24M, easy maths", "path": "runs/remote_big/plain_warm_s0/last.pt",
-     "note": "v2 Plain after stage 2. Easy maths, old QA. No experts, no neuron."},
-]
-
-
+EXTRA_RUNS = 8  # frozen runs may go past training's max_runs, up to this, to test extrapolation
+GROUPS = {  # folder under runs/ -> how the page groups its models, in this order
+    "remote_v3_s0": "v3, seed 0", "remote_v3_s1": "v3, seed 1", "remote_between": "Between block, seed 0",
+    "remote_100m": "100M (older)", "remote_big": "v2 (older)", "remote_v3": "v3 first try (older)",
+    "remote": "v1 (older)",
+}
 def load_model(path: Path) -> Spidory:
     """Weights only. mmap keeps the optimizer state on disk, so memory stays low."""
     state = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
@@ -42,24 +38,86 @@ def load_model(path: Path) -> Spidory:
     return model.eval()
 
 
+def discover(root: Path) -> list[dict]:
+    """Every run's final checkpoint under runs/<folder>/<run>/last.pt, grouped by folder."""
+    order = list(GROUPS)
+    found = []
+    for path in sorted((root / "runs").glob("*/*/last.pt")):
+        folder, run = path.parent.parent.name, path.parent.name
+        if folder not in GROUPS:
+            continue
+        found.append({"id": f"{folder}/{run}", "name": run, "group": GROUPS[folder],
+                      "path": path.relative_to(root).as_posix(), "note": ""})
+    return sorted(found, key=lambda e: (order.index(e["path"].split("/")[1]), e["name"]))
+
+
+def describe_cfg(cfg: ModelConfig, ready: bool) -> str:
+    """A short plain description of what a model is."""
+    if not cfg.use_experts:
+        kind = "Plain: no experts, no neuron"
+    else:
+        kind = f"{cfg.n_experts} experts, {cfg.active_experts} active"
+        if cfg.route_per_loop:
+            kind += ", router picks again each run"
+        if ready and cfg.run_mode == "joint":
+            kind += f", run neuron ({cfg.neuron}, trained jointly, {cfg.neuron_train})"
+        elif ready:
+            kind += ", run neuron trained after the model (post-hoc)"
+        else:
+            kind += ", no trained neuron (constant runs or warm-up)"
+    if cfg.between_layers:
+        merge = (" with learned merge" + ("" if cfg.boundary_norm else ", no normalization")
+                 if cfg.between_merge else "")
+        kind += f"; between block {cfg.between_layers} layers, {cfg.between_mode.replace('_', ' ')}{merge}"
+    return kind
+
+
 class Registry:
-    def __init__(self, root: Path, catalog: list[dict]):
-        self.root, self.models, self.lock = root, {}, threading.Lock()
-        self.entries = [e for e in catalog if (root / e["path"]).exists()]
+    """Models found on disk. With no catalog it looks again on every listing, so runs copied
+    in while the page is open appear after a reload."""
+
+    def __init__(self, root: Path, catalog: list[dict] | None = None):
+        self.root, self.catalog, self.models, self.lock = root, catalog, {}, threading.Lock()
+        self._cache: dict[str, tuple[float, dict]] = {}
+        self.entries = self._scan()
+
+    def _scan(self) -> list[dict]:
+        entries = discover(self.root) if self.catalog is None else self.catalog
+        return [e for e in entries if (self.root / e["path"]).exists()]
 
     def describe(self) -> list[dict]:
         found = []
-        for entry in self.entries:
-            state = torch.load(self.root / entry["path"], weights_only=True, map_location="cpu", mmap=True)
-            cfg = ModelConfig(**{"arch": "prenorm", **state["model_cfg"]})
-            ready = bool(state["model"].get("run_head_ready", torch.tensor(False)))
-            found.append({**{k: entry[k] for k in ("id", "name", "note")},
-                          "experts": cfg.n_experts if cfg.use_experts else 0, "max_runs": cfg.max_runs,
-                          "neuron": cfg.use_experts and ready, "width": cfg.d_model,
-                          "layers": [cfg.n_input, cfg.n_core, cfg.n_output],
-                          "between": {"layers": cfg.between_layers, "mode": cfg.between_mode,
-                                      "merge": cfg.between_merge, "boundary_norm": cfg.boundary_norm},
-                          "mflops": {k: round(v * 1e6, 1) for k, v in tflops_by_k(cfg).items()}})
+        for entry in self._scan():
+            try:
+                found.append(self._describe(entry))
+            except Exception:  # noqa: BLE001  a checkpoint still being copied in
+                continue
+        known = {f["id"] for f in found}
+        self.entries = [e for e in self._scan() if e["id"] in known]
+        return found
+
+    def _describe(self, entry: dict) -> dict:
+        stamp = (self.root / entry["path"]).stat().st_mtime
+        cached = self._cache.get(entry["id"])
+        if cached and cached[0] == stamp:
+            return cached[1]
+        state = torch.load(self.root / entry["path"], weights_only=True, map_location="cpu", mmap=True)
+        cfg = ModelConfig(**{"arch": "prenorm", **state["model_cfg"]})
+        ready = bool(state["model"].get("run_head_ready", torch.tensor(False)))
+        with torch.device("meta"):  # counts parameters without allocating them
+            params = Spidory(cfg).num_params()
+        found = {**{k: entry[k] for k in ("id", "name")}, "group": entry.get("group", "Models"),
+                 "note": entry.get("note") or describe_cfg(cfg, ready),
+                 "experts": cfg.n_experts if cfg.use_experts else 0, "max_runs": cfg.max_runs,
+                 "extra_runs": EXTRA_RUNS, "neuron": cfg.use_experts and ready,
+                 "active_experts": cfg.active_experts, "per_loop": cfg.route_per_loop,
+                 "width": cfg.d_model, "params": params,
+                 "layers": [cfg.n_input, cfg.n_core, cfg.n_output],
+                 "between": {"layers": cfg.between_layers, "mode": cfg.between_mode,
+                             "merge": cfg.between_merge, "boundary_norm": cfg.boundary_norm},
+                 "mflops": {k: round(v * 1e6, 1) for k, v in tflops_by_k(cfg, EXTRA_RUNS).items()}}
+        self._cache[entry["id"]] = (stamp, found)
+        self.models.pop(entry["id"], None)  # a replaced checkpoint loads again
         return found
 
     def get(self, model_id: str) -> Spidory:
@@ -68,6 +126,18 @@ class Registry:
                 entry = next(e for e in self.entries if e["id"] == model_id)
                 self.models[model_id] = load_model(self.root / entry["path"])
             return self.models[model_id]
+
+
+def expert_args(lock: dict | None, model: Spidory) -> dict:
+    """A column's expert lock: the router decides, or one expert runs in every loop."""
+    if not lock or lock.get("kind", "router") == "router":
+        return {}
+    if not model.cfg.use_experts:
+        raise ValueError("this model has no experts to lock")
+    expert = int(lock["value"])
+    if not 0 <= expert < model.cfg.n_experts:
+        raise ValueError(f"expert must be 0 to {model.cfg.n_experts - 1}")
+    return {"expert": expert}
 
 
 def setting_args(setting: dict, model: Spidory) -> dict:
@@ -82,8 +152,8 @@ def setting_args(setting: dict, model: Spidory) -> dict:
             raise ValueError("an average needs experts; use a frozen run count")
         return {"mean_runs": float(setting["value"])}
     runs = int(setting.get("value", 1))
-    if not 1 <= runs <= model.cfg.max_runs:
-        raise ValueError(f"runs must be 1 to {model.cfg.max_runs}")
+    if not 1 <= runs <= EXTRA_RUNS:
+        raise ValueError(f"runs must be 1 to {EXTRA_RUNS}")
     return {"k": runs}
 
 
@@ -91,7 +161,12 @@ def setting_args(setting: dict, model: Spidory) -> dict:
 def step(model: Spidory, ids: list[int], choice: dict, temperature: float, generator: torch.Generator) -> dict:
     """One generated token, with what the model decided on the way."""
     window = torch.tensor([ids[-model.cfg.seq_len:]])
-    logits, experts, runs = model.infer(window, **choice)
+    model._route_record = []
+    try:
+        logits, experts, runs = model.infer(window, **choice)
+        path = [int(r[0]) for r in model._route_record]  # the expert used in each run
+    finally:
+        model._route_record = None
     probs = F.softmax(logits[0, -1].float(), -1)
     if temperature <= 0:
         token = int(probs.argmax())
@@ -103,7 +178,7 @@ def step(model: Spidory, ids: list[int], choice: dict, temperature: float, gener
     if model.cfg.use_experts and bool(model.run_head_ready):
         pooled = model._encode(window)[1]
         neuron = [round(float(p), 4) for p in F.softmax(model.run_logits(pooled)[0, max(expert, 0)].float(), -1)]
-    return {"token": token, "expert": expert, "runs": int(runs[0]), "neuron": neuron,
+    return {"token": token, "expert": expert, "runs": int(runs[0]), "neuron": neuron, "path": path,
             "top": [[int(i), round(float(p), 4)] for p, i in zip(top.values, top.indices)]}
 
 
@@ -117,8 +192,8 @@ def run_columns(registry: Registry, tok: Tokenizer, request: dict, emit) -> None
     for index, column in enumerate(request["columns"]):
         try:
             model = registry.get(column["model"])
-            choice = setting_args(column["setting"], model)
-            cost = tflops_by_k(model.cfg)
+            choice = {**setting_args(column["setting"], model), **expert_args(column.get("experts"), model)}
+            cost = tflops_by_k(model.cfg, EXTRA_RUNS)
             columns.append({"index": index, "model": model, "choice": choice, "ids": list(prompt),
                             "text": "", "done": False, "cost": cost,
                             "generator": torch.Generator().manual_seed(int(request.get("seed", 0)))})
@@ -142,7 +217,7 @@ def run_columns(registry: Registry, tok: Tokenizer, request: dict, emit) -> None
             emit({"col": column["index"], "text": piece, "ms": round(seconds * 1000),
                   "mflops": round(column["cost"][found["runs"]] * 1e6, 1),
                   "top": [[tok.decode([i]), p] for i, p in found["top"]],
-                  **{k: found[k] for k in ("expert", "runs", "neuron")}})
+                  **{k: found[k] for k in ("expert", "runs", "neuron", "path")}})
     emit({"finished": True})
 
 
@@ -194,11 +269,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--tokenizer", default="data_large/tokenizer.json")
+    parser.add_argument("--tokenizer", default="data_v3/tokenizer.json", help="relative to --root")
+    parser.add_argument("--root", default=".", help="project folder that holds runs/")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
-    registry = Registry(Path("."), CATALOG)
-    tok = Tokenizer.from_file(args.tokenizer)
+    root = Path(args.root)
+    registry = Registry(root)
+    tok = Tokenizer.from_file(str(root / args.tokenizer))
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(registry, tok))
     print(f"Spidory playground on http://127.0.0.1:{args.port} with {len(registry.entries)} models", flush=True)
     server.serve_forever()

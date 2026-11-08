@@ -69,6 +69,8 @@ input[type=number] { width: 72px; padding: 4px 6px; border: 1px solid var(--line
 .tok.r2 { background: var(--run2); color: var(--run2-ink); }
 .tok.r3 { background: var(--run3); color: var(--run3-ink); }
 .tok.r4 { background: var(--run4); color: var(--run4-ink); }
+.tok.rx { background: var(--run4); color: var(--run4-ink); text-decoration: underline dotted; text-underline-offset: 3px; }
+.seg button.beyond { border-style: dashed; }
 .tok.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
 .err { color: var(--bad); }
 .legend { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
@@ -87,7 +89,7 @@ input[type=number] { width: 72px; padding: 4px 6px; border: 1px solid var(--line
 <div class="wrap">
   <header>
     <h1>Spidory playground</h1>
-    <p>One prompt, several models side by side. Each token is coloured by how many runs of the loop it used.</p>
+    <p>One prompt, several models side by side. In each column, lock the expert and the run count, or let the router and the run neuron decide. Each token is coloured by how many runs of the loop it used.</p>
   </header>
 
   <section class="card deck" aria-label="Prompt">
@@ -98,7 +100,6 @@ A:</textarea>
       <button data-p="Q: What is 14 + 7 - 18 - 6 + 19 + 1 + 19 - 3 + 2?&#10;A:">Long chain</button>
       <button data-p="Q: Compute (3 + (4 * 2)) - (9 - 5).&#10;A:">Brackets</button>
       <button data-p="Once upon a time, there was a little fox who">Story</button>
-      <button data-p="def read_json(path):&#10;    &quot;&quot;&quot;Read a JSON file and return its data.&quot;&quot;&quot;&#10;">Code</button>
       <button data-p="The Eiffel Tower is in Paris. It was built for the 1889 World's Fair.&#10;Q: When was the Eiffel Tower built?&#10;A:">Question</button>
     </div>
     <div class="row">
@@ -107,7 +108,8 @@ A:</textarea>
       <label class="field">Seed <input id="seed" type="number" value="0"></label>
       <span class="spacer"></span>
       <button class="ghost" id="addCol">Add column</button>
-      <button class="ghost" id="sweep">Compare frozen 1 to 4</button>
+      <button class="ghost" id="sweep">Compare runs 1 to 4</button>
+      <button class="ghost" id="sweepExperts">Compare each expert</button>
       <button class="primary" id="run">Run</button>
       <button class="ghost" id="stop" disabled>Stop</button>
     </div>
@@ -116,6 +118,7 @@ A:</textarea>
       <span><i style="background:var(--run2)"></i>2 runs</span>
       <span><i style="background:var(--run3)"></i>3 runs</span>
       <span><i style="background:var(--run4)"></i>4 runs</span>
+      <span><i style="background:var(--run4);outline:1px dashed var(--run4-ink)"></i>more than trained (dotted)</span>
       <span>Click a token to inspect it.</span>
     </div>
   </section>
@@ -137,16 +140,19 @@ let nextId = 1;
 
 const modelById = (id) => models.find((m) => m.id === id);
 
-function addColumn(model, setting) {
-  columns.push({ id: nextId++, model, setting, tokens: [], error: null, done: false });
+function addColumn(model, setting, experts = { kind: "router" }) {
+  columns.push({ id: nextId++, model, setting, experts, tokens: [], error: null, done: false });
   render();
 }
 
-function settingLabel(s) {
-  if (s.kind === "neuron") return "neuron decides";
-  if (s.kind === "mean") return `average ${s.value} runs`;
-  return `frozen at ${s.value} run${s.value > 1 ? "s" : ""}`;
+function settingLabel(s, e) {
+  const who = e && e.kind === "fixed" ? `expert ${e.value} locked` : "router picks the expert";
+  if (s.kind === "neuron") return `${who}, neuron picks the runs`;
+  if (s.kind === "mean") return `${who}, average ${s.value} runs`;
+  return `${who}, runs locked at ${s.value}`;
 }
+
+const runClass = (t, m) => (m && t.runs > m.max_runs ? "rx" : `r${t.runs}`);
 
 function stats(col) {
   const t = col.tokens;
@@ -172,13 +178,18 @@ function renderColumn(col) {
   top.className = "row";
   const select = document.createElement("select");
   select.setAttribute("aria-label", "Model");
-  models.forEach((x) => select.add(new Option(`${x.name} · ${x.experts ? x.experts + " experts" : "no experts"}`, x.id)));
+  const groups = {};
+  models.forEach((x) => {
+    if (!groups[x.group]) { groups[x.group] = document.createElement("optgroup"); groups[x.group].label = x.group; select.append(groups[x.group]); }
+    groups[x.group].append(new Option(`${x.name} · ${x.experts ? x.experts + " experts" : "no experts"}`, x.id));
+  });
   select.value = col.model;
   select.onchange = () => {
     col.model = select.value;
     const next = modelById(col.model);
     if (col.setting.kind === "neuron" && !next.neuron) col.setting = { kind: "frozen", value: 2 };
     if (col.setting.kind === "mean" && !next.experts) col.setting = { kind: "frozen", value: 2 };
+    if (col.experts.kind === "fixed" && (!next.experts || col.experts.value >= next.experts)) col.experts = { kind: "router" };
     render();
   };
   const close = document.createElement("button");
@@ -199,15 +210,28 @@ function renderColumn(col) {
   seg.append(button("Neuron decides", col.setting.kind === "neuron", m && m.neuron,
                     () => (col.setting = { kind: "neuron" }), m && !m.neuron ? "This model has no trained run neuron" : ""));
   const sep = document.createElement("span"); sep.className = "sep"; seg.append(sep);
-  const label = document.createElement("span"); label.className = "note"; label.textContent = "Freeze:"; seg.append(label);
-  for (let k = 1; k <= (m ? m.max_runs : 4); k++) {
-    seg.append(button(String(k), col.setting.kind === "frozen" && col.setting.value === k, true,
-                      () => (col.setting = { kind: "frozen", value: k })));
+  const label = document.createElement("span"); label.className = "note"; label.textContent = "Lock runs:"; seg.append(label);
+  for (let k = 1; k <= (m ? m.extra_runs : 4); k++) {
+    const b = button(String(k), col.setting.kind === "frozen" && col.setting.value === k, true,
+                     () => (col.setting = { kind: "frozen", value: k }),
+                     m && k > m.max_runs ? `More runs than training used (${m.max_runs}): tests extrapolation` : "");
+    if (m && k > m.max_runs) b.classList.add("beyond");
+    seg.append(b);
   }
   seg.append(button("Average", col.setting.kind === "mean", m && m.experts,
                     () => (col.setting = { kind: "mean", value: 2.5 }), m && !m.experts ? "Average runs needs experts" : ""));
 
-  head.append(top, seg);
+  const eseg = document.createElement("div");
+  eseg.className = "seg";
+  const elabel = document.createElement("span"); elabel.className = "note"; elabel.textContent = "Expert:"; eseg.append(elabel);
+  eseg.append(button("Router decides", col.experts.kind === "router", true, () => (col.experts = { kind: "router" })));
+  for (let e = 0; e < (m ? m.experts : 0); e++) {
+    eseg.append(button(`Lock ${e}`, col.experts.kind === "fixed" && col.experts.value === e, true,
+                       () => (col.experts = { kind: "fixed", value: e }), `Expert ${e} runs in every loop, for every token`));
+  }
+  if (m && !m.experts) { const n = document.createElement("span"); n.className = "note"; n.textContent = "this model has no experts"; eseg.append(n); }
+
+  head.append(top, seg, eseg);
   if (col.setting.kind === "mean") {
     const row = document.createElement("label");
     row.className = "mean";
@@ -221,7 +245,7 @@ function renderColumn(col) {
   }
   const note = document.createElement("div");
   note.className = "note";
-  note.textContent = m ? `${settingLabel(col.setting)} · width ${m.width}, layers ${m.layers.join("/")} · ${m.note}` : "";
+  note.textContent = m ? `${settingLabel(col.setting, col.experts)} · ${(m.params / 1e6).toFixed(1)}M params, layers ${m.layers.join("/")} · ${m.note}` : "";
   head.append(note);
 
   const s = stats(col);
@@ -240,7 +264,7 @@ function renderColumn(col) {
   out.append(p);
   col.tokens.forEach((t, i) => {
     const span = document.createElement("span");
-    span.className = `tok r${t.runs}`;
+    span.className = `tok ${runClass(t, m)}`;
     span.textContent = t.text;
     span.tabIndex = 0;
     span.title = `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? ", expert " + t.expert : ""}`;
@@ -277,8 +301,9 @@ function inspect(col, t, i) {
   box.className = "";
   const head = document.createElement("p");
   head.style.margin = "0";
-  head.textContent = `${m.name}, ${settingLabel(col.setting)}. Token ${i + 1}: ${JSON.stringify(t.text)}. ` +
-    `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? `, expert ${t.expert}` : ""}, ${t.mflops} MFLOPs, ${t.ms} ms.`;
+  const path = t.path && t.path.length ? ` Expert in each run: ${t.path.join(" → ")}.` : "";
+  head.textContent = `${m.name}, ${settingLabel(col.setting, col.experts)}. Token ${i + 1}: ${JSON.stringify(t.text)}. ` +
+    `${t.runs} run${t.runs > 1 ? "s" : ""}${t.expert >= 0 ? `, expert ${t.expert}` : ""}, ${t.mflops} MFLOPs, ${t.ms} ms.${path}`;
   const split = document.createElement("div"); split.className = "split";
   split.append(bars("Most likely next tokens", t.top.map(([w, p]) => [JSON.stringify(w), p])));
   if (t.neuron) split.append(bars("Run neuron: chance of each run count", t.neuron.map((p, k) => [`${k + 1} run${k ? "s" : ""}`, p])));
@@ -294,7 +319,7 @@ async function run() {
   $("#run").disabled = true; $("#stop").disabled = false;
   const body = { prompt: $("#prompt").value, max_tokens: Number($("#maxTokens").value),
                  temperature: Number($("#temperature").value), seed: Number($("#seed").value),
-                 columns: columns.map((c) => ({ model: c.model, setting: c.setting })) };
+                 columns: columns.map((c) => ({ model: c.model, setting: c.setting, experts: c.experts })) };
   let pending = false;
   const schedule = () => { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } };
   try {
@@ -331,15 +356,23 @@ $("#presets").onclick = (e) => { const b = e.target.closest("button"); if (b) { 
 $("#prompt").oninput = () => render();
 $("#addCol").onclick = () => addColumn(models[0].id, { kind: "frozen", value: 2 });
 $("#sweep").onclick = () => {
-  const base = columns.length ? columns[columns.length - 1].model : models[0].id;
-  for (let k = 1; k <= 4; k++) addColumn(base, { kind: "frozen", value: k });
+  const last = columns[columns.length - 1];
+  const base = last ? last.model : models[0].id;
+  const m = modelById(base);
+  for (let k = 1; k <= m.max_runs; k++) addColumn(base, { kind: "frozen", value: k }, last ? { ...last.experts } : undefined);
+};
+$("#sweepExperts").onclick = () => {
+  const last = columns[columns.length - 1];
+  const m = modelById(last ? last.model : models[0].id);
+  if (!m.experts) return;
+  for (let e = 0; e < m.experts; e++) addColumn(m.id, last ? { ...last.setting } : { kind: "frozen", value: 2 }, { kind: "fixed", value: e });
 };
 
 (async () => {
   models = await (await fetch("/api/models")).json();
   if (!models.length) { $("#columns").textContent = "No trained models were found in runs/."; return; }
-  const neuron = models.find((m) => m.neuron);
-  const plain = models.find((m) => !m.experts);
+  const neuron = models.find((m) => m.id.endsWith("neuron_between_per_gap_s0")) || models.find((m) => m.neuron);
+  const plain = models.find((m) => !m.experts && m.group === neuron?.group) || models.find((m) => !m.experts);
   if (neuron) { addColumn(neuron.id, { kind: "neuron" }); addColumn(neuron.id, { kind: "frozen", value: 1 }); addColumn(neuron.id, { kind: "frozen", value: 2 }); }
   if (plain) addColumn(plain.id, { kind: "frozen", value: 2 });
 })();

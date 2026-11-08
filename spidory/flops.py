@@ -25,7 +25,7 @@ def _ngpt_block_macs(d: int, t: int) -> int:
     return feed_forward + attention_weights + 2 * t * t * d
 
 
-def tflops_by_k(cfg) -> dict[int, float]:
+def tflops_by_k(cfg, upto: int | None = None) -> dict[int, float]:
     """TFLOPS per token at each run count, using one expert when the model has experts."""
     d, t = cfg.d_model, cfg.seq_len
     ngpt = getattr(cfg, "arch", "prenorm") == "ngpt"
@@ -35,7 +35,7 @@ def tflops_by_k(cfg) -> dict[int, float]:
     if cfg.use_experts:
         per_run += (3 if ngpt else 2) * d * cfg.expert_dim * t
     between = getattr(cfg, "between_layers", 0) * block  # runs between centre runs: k - 1 times
-    return {k: 2 * (fixed + k * per_run + (k - 1) * between) / t / TERA for k in range(1, cfg.max_runs + 1)}
+    return {k: 2 * (fixed + k * per_run + (k - 1) * between) / t / TERA for k in range(1, (upto or cfg.max_runs) + 1)}
 
 
 def average_tflops(table: dict[int, float], run_counts: list[int]) -> float:
