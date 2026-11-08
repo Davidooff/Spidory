@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
 import hashlib
 import json
 import operator
@@ -141,6 +142,11 @@ def _steps_with_reasons(text: str) -> tuple[list[tuple[int, str, int, int, str |
 def _say(rng: random.Random, step) -> str:
     left, symbol, right, value, _, continues = step
     bank = RUNNING[symbol] if continues and rng.random() < 0.6 else SAY[symbol]
+    # "3 groups of -2" and "taking 15 away from 3 leaves -12" read badly: plain words instead.
+    if symbol == "*" and (left < 0 or right < 0):
+        bank = [b for b in bank if "groups" not in b]
+    if symbol == "-" and value < 0:
+        bank = [b for b in bank if "leaves" not in b and "take away" not in b] or [SAY["-"][0]]
     return rng.choice(bank).format(x=left, y=right, z=value)
 
 
@@ -215,12 +221,57 @@ def explain_prompt(item: em.Item) -> str:
 
 
 def answer_of(text: str) -> str | None:
-    """The number after "The answer is", or None."""
-    found = re.search(r"[Tt]he answer is (-?\d+)", text)
-    return found.group(1) if found else None
+    """The number after the last "the answer is", without thousands commas, or None."""
+    found = re.findall(r"[Tt]he answer is (-?\d[\d,]*(?:\.\d+)?)", text)
+    return found[-1].replace(",", "") if found else None
+
+
+@functools.cache
+def held_expressions() -> frozenset[str]:
+    """Every maths expression kept for validation or test (levels 1-3 and 5 are listed)."""
+    return frozenset(text for (_, _, split), entries in em._pools().items() if split in ("val", "test")
+                     for text, _ in entries)
+
+
+def held_out(text: str) -> bool:
+    """True for an expression that training data must not show: listed held-out ones, and any
+    other expression whose hash puts it in the maths validation or test split."""
+    return text in held_expressions() or em._split_of(text) != "train"
 
 
 # ----- templates -----
+
+def split_of(t: dict) -> str:
+    """A template's split: by its cluster when load_templates assigned one, else by its id."""
+    return t.get("split") or _split_of_id(t["id"])
+
+
+def assign_splits(templates: list[dict]) -> None:
+    """Near-duplicate templates go to one split: the same question and formula, or passages
+    sharing at least half their words. Each cluster is split by its first id."""
+    parent = list(range(len(templates)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    words = [set(re.findall(r"[a-z]+", t["context"].lower())) for t in templates]
+    keys = [(re.sub(r"\s+", " ", t["question"].lower()), t["answer"].replace(" ", "")) for t in templates]
+    for i in range(len(templates)):
+        for j in range(i + 1, len(templates)):
+            close = len(words[i] & words[j]) / max(1, len(words[i] | words[j])) >= 0.5
+            if keys[i] == keys[j] or close:
+                parent[root(i)] = root(j)
+    clusters: dict[int, list[int]] = {}
+    for i in range(len(templates)):
+        clusters.setdefault(root(i), []).append(i)
+    for members in clusters.values():
+        first = min(templates[i]["id"] for i in members)
+        for i in members:
+            templates[i]["split"] = _split_of_id(first)
+
 
 def _split_of_id(template_id: str) -> str:
     share = int.from_bytes(hashlib.sha256(template_id.encode()).digest()[:8], "big") / 2 ** 64
@@ -283,17 +334,25 @@ def load_templates(folder: Path) -> tuple[list[dict], list[str]]:
                 found.append(t)
             except (ValueError, SyntaxError, KeyError, TypeError) as error:
                 dropped.append(f"{path.name}:{number}: {error}")
+    assign_splits(found)
     return found, dropped
 
 
-def fill(t: dict, rng: random.Random, explain: bool) -> tuple[str, str, int]:
-    """(context, question and answer, value) for one random filling of a template."""
-    values = {k: rng.randint(*v) for k, v in t["vars"].items()}
+def fill(t: dict, rng: random.Random, explain: bool, split: str = "test") -> tuple[str, str, int]:
+    """(context, question and answer, value) for one random filling of a template.
+
+    For training (split "train"), fillings whose formula would be a held-out maths expression
+    are drawn again, so the maths exams stay unseen.
+    """
+    for _ in range(100):
+        values = {k: rng.randint(*v) for k, v in t["vars"].items()}
+        filled = re.sub(r"\b[a-d]\b", lambda m: str(values[m.group()]), t["answer"])
+        if split != "train" or not held_out(filled):
+            break
     name, name2 = rng.sample(NAMES, 2)
     words = {"name": name, "name2": name2, **{k: str(v) for k, v in values.items()}}
     context = re.sub(r"\{(\w+)\}", lambda m: words[m.group(1)], t["context"])
     question = re.sub(r"\{(\w+)\}", lambda m: words[m.group(1)], t["question"])
-    filled = re.sub(r"\b[a-d]\b", lambda m: str(values[m.group()]), t["answer"])
     if explain:
         body, value = words_for_expression(filled, rng)
         tail = f"\nQ: {question} {EXPLAIN}\nA: {body} {rng.choice(CLOSE).format(z=value)}"
@@ -370,7 +429,7 @@ def build_mixed(root: Path, tok: Tokenizer, templates: list[dict], seed: int, tr
     for split, target in (("train", train_tokens), ("val", held_tokens), ("test", held_tokens)):
         rng = random.Random(f"mixed:{seed}:{split}")
         starts = {n: _doc_starts(np.asarray(streams[n, split]), eod) for n in TOPICS}
-        group = [t for t in templates if _split_of_id(t["id"]) == split]
+        group = [t for t in templates if split_of(t) == split]
         if not group:
             raise ValueError(f"no templates for the {split} split")
         writer = Writer(root, "mixed", split, labelled=True)
@@ -395,7 +454,7 @@ def build_mixed(root: Path, tok: Tokenizer, templates: list[dict], seed: int, tr
                 writer.add(pieces[:-1], eod)
             else:  # an insertion: a passage with a computation inside
                 t = rng.choice(group)
-                context, tail, value = fill(t, rng, explain=rng.random() < 0.3)
+                context, tail, value = fill(t, rng, explain=rng.random() < 0.3, split=split)
                 host = TOPICS["story"] if t["kind"] == "story" else TOPICS["qa"]
                 pieces = [(tok.encode(context).ids, host), (tok.encode(tail).ids, TOPICS["maths"])]
                 if rng.random() < 0.3:  # sometimes the topic changes first
@@ -453,9 +512,9 @@ def _numbers_text(values: list[int]) -> str:
     return ", ".join(map(str, values[:-1])) + " and " + str(values[-1]) if len(values) > 1 else str(values[0])
 
 
-def compose_story_item(t: dict, rng: random.Random) -> dict:
+def compose_story_item(t: dict, rng: random.Random, split: str = "test") -> dict:
     """A request to write a problem with given numbers and answer, and a correct reply."""
-    context, tail, value = fill(t, rng, explain=False)
+    context, tail, value = fill(t, rng, explain=False, split=split)
     numbers = [int(n) for n in re.findall(r"\d+", context)]
     used = sorted(set(numbers), key=numbers.index)
     bank = COMPOSE_STORY if t["kind"] == "story" else COMPOSE_FACT
@@ -489,9 +548,12 @@ def _expression(rng: random.Random, kind: str) -> tuple[str, int, int]:
     return text, explain_expression(text)[1], 3
 
 
-def compose_expression_item(rng: random.Random) -> dict:
+def compose_expression_item(rng: random.Random, split: str = "test") -> dict:
     kind = rng.choice(list(COMPOSE_SUM))
-    text, value, n = _expression(rng, kind)
+    while True:
+        text, value, n = _expression(rng, kind)
+        if split != "train" or not held_out(text):  # never train on a maths exam expression
+            break
     request = rng.choice(COMPOSE_SUM[kind]).format(n=n, t=value)
     return {"kind": kind, "prompt": f"Task: {request}\nAnswer:", "reply": f" {text} = {value}",
             "count": n, "answer": value}
@@ -507,9 +569,15 @@ def grade_compose(item: dict, text: str) -> bool:
     """Whether a model's reply does what the task asked. Checked by computing, not by matching."""
     text = text.strip()
     if item["kind"] == "story":
-        numbers = [int(n) for n in re.findall(r"\d+", text)]
-        last = re.findall(r"A: (-?\d+)", text)
-        return bool(last) and int(last[-1]) == item["answer"] and all(n in numbers for n in item["numbers"])
+        # A passage with every given number, then a question line, then the answer line. Whether
+        # the story's own arithmetic gives that answer cannot be checked by code.
+        if "\nQ: " not in text:
+            return False
+        passage = text.split("\nQ: ")[0]
+        numbers = [int(n) for n in re.findall(r"\d+", passage)]
+        last = re.findall(r"\nA: (-?\d+)", text)
+        return (bool(last) and int(last[-1]) == item["answer"] and len(passage.split()) >= 8
+                and all(n in numbers for n in item["numbers"]))
     if item["kind"] == "question":
         line = text.split("\n")[0].strip()
         try:
@@ -517,6 +585,8 @@ def grade_compose(item: dict, text: str) -> bool:
             if letters:  # "a = 7, b = a + 5. What is b?"
                 return explain_variables(f"{letters.group(1)}; {letters.group(2)}")[1] == item["answer"]
             expression = re.sub(r"^(What is|Calculate|Compute)\s+", "", line).rstrip("?.= ").strip()
+            if not explain_expression(expression)[0]:  # "What is 17?" is not a question to work out
+                return False
             return explain_expression(expression)[1] == item["answer"]
         except (ValueError, SyntaxError, KeyError):
             return False
@@ -537,7 +607,7 @@ def grade_compose(item: dict, text: str) -> bool:
         "-": ops == {"-"},
         "*": ops == {"*"} and len(numbers) == 2,
         "mix": {"+", "-"} <= ops and len(numbers) == item.get("count", len(numbers)),
-        "brackets": "(" in left and ")" in left,
+        "brackets": bool(re.search(r"\([^()]*\d\s*[+*-]\s*-?\d[^()]*\)", left)),
     }[item["kind"]]
 
 
@@ -549,22 +619,23 @@ def build_compose(root: Path, tok: Tokenizer, templates: list[dict], seed: int, 
     counts = {}
     for split, target in (("train", train_tokens), ("val", held_tokens), ("test", held_tokens)):
         rng = random.Random(f"compose:{seed}:{split}")
-        group = [t for t in templates if _split_of_id(t["id"]) == split]
+        group = [t for t in templates if split_of(t) == split]
         questions = (i for batch in generate(split, 10 ** 9, seed + 31, pools) for i in batch)
         writer = Writer(root, "compose", split, labelled=False)
         while writer.count < target:
             roll = rng.random()
-            item = (compose_story_item(rng.choice(group), rng) if roll < 0.5 else
-                    compose_expression_item(rng) if roll < 0.8 else compose_question_item(next(questions), rng))
+            item = (compose_story_item(rng.choice(group), rng, split) if roll < 0.5 else
+                    compose_expression_item(rng, split) if roll < 0.8 else
+                    compose_question_item(next(questions), rng))
             writer.add([(tok.encode(item["prompt"] + item["reply"]).ids, 1)], eod)
         writer.close()
         counts[split] = writer.count
     rng = random.Random(f"compose-exam:{seed}")
-    group = [t for t in templates if _split_of_id(t["id"]) == "test"]
+    group = [t for t in templates if split_of(t) == "test"]
     questions = (i for batch in generate("test", 10 ** 9, seed + 37, pools) for i in batch)
     exam = []
     for index in range(exam_size):
-        item = (compose_story_item(group[index % len(group)], rng) if index % 3 == 0 else
+        item = (compose_story_item(group[(index // 3) % len(group)], rng) if index % 3 == 0 else
                 compose_expression_item(rng) if index % 3 == 1 else compose_question_item(next(questions), rng))
         exam.append({k: v for k, v in item.items() if k != "reply"})
     (root / "compose_exam.json").write_text(json.dumps(exam))
@@ -573,8 +644,9 @@ def build_compose(root: Path, tok: Tokenizer, templates: list[dict], seed: int, 
 
 # ----- word problems from public datasets -----
 
-def _windows(text: str, size: int = 10) -> set[tuple[str, ...]]:
-    words = re.findall(r"\w+", text.lower())
+def _windows(text: str, size: int = 8) -> set[tuple[str, ...]]:
+    """Word windows with every number replaced, so a rewrite with new numbers still matches."""
+    words = ["#" if w.isdigit() else w for w in re.findall(r"\w+", text.lower())]
     return {tuple(words[i:i + size]) for i in range(max(0, len(words) - size + 1))}
 
 
@@ -586,24 +658,22 @@ def gsm8k_reply(answer: str) -> tuple[str, str]:
     return f"{body}\nThe answer is {final}.", final
 
 
-def build_wordmath(root: Path, tok: Tokenizer, seed: int) -> dict[str, int]:
-    """Orca-Math 200k and GSM8K train for training; GSM8K test and SVAMP only as exams.
+def build_wordmath(root: Path, tok: Tokenizer, seed: int, longest: int = 512) -> dict[str, int]:
+    """Orca-Math 200k and GSM8K train for training; GSM8K test only as an exam.
 
-    Training problems that share a 10-word passage with any exam question are dropped.
+    Training problems sharing an 8-word passage with an exam question (numbers masked) are
+    dropped. SVAMP is used for nothing: Orca-Math rewrites many SVAMP problems with new numbers,
+    so a SVAMP score would measure memory. Problems over 512 tokens (twice the context) are
+    dropped: a limit of 256 kept only 47k problems (9M tokens), too few for a seventh of training.
     """
     from .data import fetch_parquet
 
     gsm_train = fetch_parquet("openai/gsm8k", "main/train-00000-of-00001.parquet").to_pylist()
     gsm_test = fetch_parquet("openai/gsm8k", "main/test-00000-of-00001.parquet").to_pylist()
     orca = fetch_parquet("microsoft/orca-math-word-problems-200k", "data/train-00000-of-00001.parquet").to_pylist()
-    svamp = (fetch_parquet("ChilleD/SVAMP", "data/train-00000-of-00001.parquet").to_pylist()
-             + fetch_parquet("ChilleD/SVAMP", "data/test-00000-of-00001.parquet").to_pylist())
     exams = {
         "gsm8k_exam.json": [{"prompt": f"Q: {r['question']}\nA:", "answer": gsm8k_reply(r["answer"])[1]}
                             for r in gsm_test],
-        "svamp_exam.json": [{"prompt": f"Q: {r['Body'].strip()} {r['Question'].strip()}\nA:",
-                             "answer": str(int(float(r["Answer"]))) if float(r["Answer"]).is_integer()
-                             else str(r["Answer"])} for r in svamp],
     }
     held = set()
     for rows in exams.values():
@@ -623,11 +693,14 @@ def build_wordmath(root: Path, tok: Tokenizer, seed: int) -> dict[str, int]:
     random.Random(seed).shuffle(docs)
     cut = max(1, len(docs) // 100)
     eod = tok.token_to_id("[EOD]")
-    counts = {"dropped_for_overlap": dropped}
+    counts = {"dropped_for_overlap": dropped, "dropped_too_long": 0}
     for split, part in (("val", docs[:cut]), ("test", docs[cut:2 * cut]), ("train", docs[2 * cut:])):
         writer = Writer(root, "wordmath", split, labelled=False)
         for start in range(0, len(part), 2000):
             for enc in tok.encode_batch(part[start:start + 2000]):
+                if len(enc.ids) + 1 > longest:
+                    counts["dropped_too_long"] += 1
+                    continue
                 writer.add([(enc.ids, 1)], eod)
         writer.close()
         counts[split] = writer.count

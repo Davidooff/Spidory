@@ -141,11 +141,20 @@ def compose_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **
     """Share of "write a problem" tasks done as asked, checked by computing the reply."""
     from .mixed_data import grade_compose
 
-    def done(text):  # a story problem ends with its answer line; the others with one line
-        return bool(re.search(r"A: -?\d+\s*$", text)) if "A: " in text else text.count("\n") >= 2
-
     items = exam[:questions]
-    return sum(grade_compose(i, generate_text(model, tok, i["prompt"], 120, done, **choice)) for i in items) / max(1, len(items))
+    return sum(grade_compose(i, generate_text(model, tok, i["prompt"], 180, compose_done(i), **choice))
+               for i in items) / max(1, len(items))
+
+
+def compose_done(item: dict):
+    """When a reply is complete: a story ends after its answer line, a question after its
+    "Answer:" line, an expression after its one line. A whole line is needed, because a number
+    of several tokens arrives one token at a time."""
+    if item["kind"] == "story":
+        return lambda text: bool(re.search(r"\nA: [^\n]*\n", text))
+    if item["kind"] == "question":
+        return lambda text: bool(re.search(r"Answer: [^\n]*\n", text))
+    return lambda text: "\n" in text
 
 
 def word_problem_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
@@ -158,14 +167,17 @@ def word_problem_accuracy(model, tok: Tokenizer, exam: list[dict], questions: in
     items = exam[:questions]
     hits = 0
     for item in items:
-        text = generate_text(model, tok, item["prompt"], 160, done, **choice).split("\nQ:")[0]
+        text = generate_text(model, tok, item["prompt"], 300, done, **choice).split("\nQ:")[0]
         found = last_number(text)
-        hits += found is not None and found.rstrip("0").rstrip(".") == item["answer"].rstrip("0").rstrip(".")
+        try:
+            hits += found is not None and float(found) == float(item["answer"])
+        except ValueError:
+            pass
     return hits / max(1, len(items))
 
 
 @torch.no_grad()
-def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 160,
+def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 220,
                      **choice) -> float:
     """Exact-answer rate when the model explains its steps first and ends with "The answer is N"."""
     from .mixed_data import answer_of
@@ -218,20 +230,27 @@ def mixed_topic_loss(model, corpus: Corpus, windows: int, chunk: int = 32, **cho
     return {name: round(float(total[i] / count[i].clamp(min=1)), 4) for name, i in TOPICS.items()}
 
 
-def extra_scores(model, corpus: Corpus, tok: Tokenizer, windows: int, questions: int, **choice) -> dict:
-    """Scores on the mixed-topic and explained-maths sets, when this corpus has them."""
+def extra_scores(model, corpus: Corpus, tok: Tokenizer, windows: int, questions: int,
+                 generate: bool = True, **choice) -> dict:
+    """Scores on the mixed-topic and explained-maths sets, when this corpus has them.
+
+    The long generation exams (explained maths, writing a problem, GSM8K) run only when
+    `generate` is true, since without a cache they cost tens of minutes per setting.
+    """
     root, found = Path(corpus.root), {}
     if "mixed" in DATASETS and (root / "mixed.test.labels").exists():
         found["mixed_topics"] = mixed_topic_loss(model, corpus, windows, **choice)
         exam = json.loads((root / "mixed_exam.json").read_text())
         found["mixed_accuracy"] = round(maths_accuracy(model, tok, exam, min(questions, len(exam)), **choice), 4)
+    if not generate:
+        return found
     if "explain" in DATASETS and (root / "explain_exam.json").exists():
         exam = json.loads((root / "explain_exam.json").read_text())
-        found["explain_accuracy"] = round(explain_accuracy(model, tok, exam, min(questions, 120), **choice), 4)
+        found["explain_accuracy"] = round(explain_accuracy(model, tok, exam, min(questions, 180), **choice), 4)
     if "compose" in DATASETS and (root / "compose_exam.json").exists():
         exam = json.loads((root / "compose_exam.json").read_text())
         found["compose_accuracy"] = round(compose_accuracy(model, tok, exam, min(questions, 150), **choice), 4)
-    for name in ("gsm8k", "svamp"):
+    for name in ("gsm8k",):
         if "wordmath" in DATASETS and (root / f"{name}_exam.json").exists():
             exam = json.loads((root / f"{name}_exam.json").read_text())
             found[f"{name}_accuracy"] = round(word_problem_accuracy(model, tok, exam, min(questions, 150), **choice), 4)
@@ -276,7 +295,8 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
         return {"loss": {k: round(v, 4) for k, v in losses.items()},
                 "mean_loss": round(sum(losses.values()) / len(losses), 4),
                 "maths_accuracy": (levels := accuracy_by_level(model, tok, exam, questions, **choice))["all"],
-                "maths_levels": levels} | extra_scores(model, corpus, tok, windows, questions, **choice)
+                "maths_levels": levels} | extra_scores(model, corpus, tok, windows, questions,
+                                                       generate=choice in GENERATE_AT, **choice)
 
     cost = tflops_by_k(model.cfg)
     result["cycle"] = cycle_loss(model, corpus, windows)
@@ -293,6 +313,8 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
         result["policy"] = policy_test(model, corpus, windows)
     return result
 
+
+GENERATE_AT = ({"k": 1}, {"k": 3}, {"learned": True})  # long exams only here
 
 @torch.no_grad()
 def sequence_losses(model, corpus: Corpus, split: str, windows: int, chunk: int = 32, **choice) -> dict:

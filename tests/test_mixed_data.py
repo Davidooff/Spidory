@@ -175,8 +175,7 @@ def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):
     md.build_compose(tmp_path, tok, _templates(), 0, 6_000, 3_000, exam_size=3)
     for split in data.SPLITS:  # any token file will do for the loss; the exams are what is tested
         (tmp_path / f"wordmath.{split}.bin").write_bytes((tmp_path / f"explain.{split}.bin").read_bytes())
-    for name in ("gsm8k", "svamp"):
-        (tmp_path / f"{name}_exam.json").write_text(json.dumps([{"prompt": "Q: What is 3 + 4?\nA:", "answer": "7"}]))
+    (tmp_path / "gsm8k_exam.json").write_text(json.dumps([{"prompt": "Q: What is 3 + 4?\nA:", "answer": "7"}]))
     names = ("story", "maths", "qa", "mixed", "explain", "compose", "wordmath")
     monkeypatch.setattr(data, "DATASETS", names)
     monkeypatch.setattr(evaluate, "DATASETS", names)
@@ -187,8 +186,9 @@ def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):
     found = evaluate.extra_scores(model, corpus, tok, 4, 3, k=2)
     assert set(found["mixed_topics"]) == {"story", "maths", "qa"}
     assert all(np.isfinite(v) for v in found["mixed_topics"].values())
-    for key in ("mixed_accuracy", "explain_accuracy", "compose_accuracy", "gsm8k_accuracy", "svamp_accuracy"):
+    for key in ("mixed_accuracy", "explain_accuracy", "compose_accuracy", "gsm8k_accuracy"):
         assert 0 <= found[key] <= 1, key
+    assert "explain_accuracy" not in evaluate.extra_scores(model, corpus, tok, 4, 3, generate=False, k=2)
 
 
 def test_answer_reader():
@@ -260,6 +260,63 @@ def test_word_problems_keep_exams_out_of_training(tmp_path, tok, monkeypatch):
     assert "old mill" not in text and "<<" not in text
     gsm = json.loads((tmp_path / "gsm8k_exam.json").read_text())
     assert gsm == [{"prompt": f"Q: {shared}. How many did he sell?\nA:", "answer": "10"}]
-    assert json.loads((tmp_path / "svamp_exam.json").read_text())[0]["answer"] == "5"
+    assert not (tmp_path / "svamp_exam.json").exists()  # contaminated by Orca rewrites, so unused
     assert md.gsm8k_reply("2+2=<<2+2=4>>4\n#### 1,204") == ("2+2=4\nThe answer is 1204.", "1204")
     assert md.last_number("So she has 12 left.") == "12" and md.last_number("The answer is 7. Then 9") == "7"
+    assert md.answer_of("The answer is 3. No wait, the answer is 1,200.") == "1200"
+
+
+def test_rewrites_with_new_numbers_are_caught():
+    exam = "Each basket of peaches has 19 red peaches and 4 green peaches. If there are 15 such baskets"
+    rewrite = "Each basket of peaches has 7 red peaches and some green peaches. There are 9 such baskets"
+    assert md._windows(exam) & md._windows(rewrite)
+
+
+def test_training_never_shows_a_maths_exam_expression():
+    rng = random.Random(0)
+    held = md.held_expressions()
+    assert "26 - 18" in held or any(" - " in h for h in held)
+    for _ in range(5000):
+        item = md.compose_expression_item(rng, "train")
+        assert not md.held_out(item["reply"].split("=")[0].strip()), item
+    small = GOOD | {"answer": "a - b", "vars": {"a": [10, 30], "b": [1, 9]},
+                    "context": "{name} had {a} shells and gave {b} away."}
+    for _ in range(2000):
+        for explain in (False, True):
+            context, tail, value = md.fill(small, rng, explain, split="train")
+            a, b = [int(n) for n in __import__("re").findall(r"\d+", context)]
+            assert not md.held_out(f"{a} - {b}")
+
+
+def test_replies_are_complete_before_generation_stops(tok):
+    """Fed one token at a time, a correct reply must not stop early and must then pass."""
+    rng = random.Random(2)
+    questions = (i for b in generate("test", 50, 0, em._pools()) for i in b)
+    items = [md.compose_story_item(t, rng) for t in _templates()[:10]] + \
+            [md.compose_expression_item(rng) for _ in range(20)] + [md.compose_question_item(next(questions), rng) for _ in range(10)]
+    for item in items:
+        ids = tok.encode(item["reply"] + "\n").ids
+        done = evaluate.compose_done(item)
+        stopped = next((i for i in range(1, len(ids) + 1) if done(tok.decode(ids[:i]))), None)
+        assert stopped is not None, item
+        assert md.grade_compose(item, tok.decode(ids[:stopped])), (item, tok.decode(ids[:stopped]))
+
+
+def test_grader_refuses_trivial_replies():
+    assert not md.grade_compose({"kind": "brackets", "answer": 12}, "(12) = 12")
+    assert md.grade_compose({"kind": "brackets", "answer": 14}, "(3 + 4) * 2 = 14")
+    assert not md.grade_compose({"kind": "question", "answer": 17}, "What is 17?\nAnswer: 17")
+    story = {"kind": "story", "numbers": [12, 5, 3], "answer": 14}
+    assert not md.grade_compose(story, "12 5 3\nA: 14")
+    assert md.grade_compose(story, "Tom had 12 cards. He won 5 more and lost 3 of them in the park.\nQ: How many now?\nA: 14")
+
+
+def test_near_duplicate_templates_share_a_split():
+    a = GOOD | {"id": "s001"}
+    b = GOOD | {"id": "s999", "context": GOOD["context"].replace("shells", "stones")}
+    c = GOOD | {"id": "f500", "kind": "fact", "question": "How many years passed?", "answer": "a * b",
+                "context": "The town of Velmora built {a} bridges, each with {b} arches, while {c} were planned."}
+    templates = [a, b, c]
+    md.assign_splits(templates)
+    assert a["split"] == b["split"]
+    assert md.split_of(c) == c["split"]
