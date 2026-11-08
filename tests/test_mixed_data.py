@@ -55,6 +55,18 @@ def test_every_level_explains_to_the_true_answer(items):
     assert {i.level for i in items["train"]} == set(LEVELS)
 
 
+def test_explanations_read_as_sentences(items):
+    rng = random.Random(0)
+    for item in items["train"]:
+        text = md.explain_item(item, rng)
+        body = text.split("\nA: ", 1)[1]
+        assert (body[0].isupper() or body[0].isdigit() or body[0] == "-") and body.endswith(".")
+        for clumsy in ("then then", "Then then", "Now then", "Last, then", "that is", "  ", ". ."):
+            assert clumsy not in body, (clumsy, body)
+        # Every number in the explanation's results agrees with the arithmetic: re-check the sums.
+        assert md.answer_of(body) == str(item.answer)
+
+
 def test_explained_questions_keep_the_maths_split(items):
     """Test expressions of the maths sets must never be explained in training."""
     train = {i.expression for i in items["train"]}
@@ -94,7 +106,10 @@ def test_filled_answers_are_computed():
             numbers = [int(n) for n in __import__("re").findall(r"\d+", context)]
             assert value == numbers[0] + numbers[1] - numbers[2]
             assert "{" not in context + tail
-            assert tail.endswith(f"The answer is {value}." if explain else f"A: {value}")
+            if explain:
+                assert tail.endswith(".") and md.answer_of(tail) == str(value)
+            else:
+                assert tail.endswith(f"A: {value}")
 
 
 def test_template_splits_are_stable_and_held_out():
@@ -149,8 +164,8 @@ def test_explain_dataset_and_exam(tmp_path, tok):
     assert counts["train"] >= 20_000
     exam = json.loads((tmp_path / "explain_exam.json").read_text())
     assert len(exam) == 5 * len(LEVELS) and all(e["prompt"].endswith(f"{md.EXPLAIN}\nA:") for e in exam)
-    text = tok.decode(np.fromfile(tmp_path / "explain.train.bin", dtype=np.uint16)[:400].tolist())
-    assert "The answer is" in text
+    text = tok.decode(np.fromfile(tmp_path / "explain.train.bin", dtype=np.uint16)[:3000].tolist())
+    assert "answer is" in text
 
 
 def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):

@@ -77,13 +77,137 @@ def explain_variables(expression: str) -> tuple[list[str], int]:
     return steps, values[target.strip()]
 
 
-def explain_item(item: em.Item) -> str:
-    steps, value = (explain_variables(item.expression) if item.level == 8
-                    else explain_expression(item.expression))
+
+# ----- explanations in words -----
+
+WORD_OPS = {"+": "plus", "-": "minus", "*": "times"}
+SAY = {
+    "+": ("{x} plus {y} is {z}", "adding {y} to {x} gives {z}", "{x} and {y} make {z}",
+          "if we add {y} to {x}, we get {z}"),
+    "-": ("{x} minus {y} is {z}", "taking {y} away from {x} leaves {z}", "subtracting {y} from {x} gives {z}",
+          "{x} take away {y} is {z}"),
+    "*": ("{x} times {y} is {z}", "multiplying {x} by {y} gives {z}", "{y} groups of {x} make {z}",
+          "{x} multiplied by {y} is {z}"),
+}
+RUNNING = {  # a step that continues from the previous result
+    "+": ("adding {y} gives {z}", "we add {y} and get {z}", "with {y} more we have {z}"),
+    "-": ("taking away {y} leaves {z}", "we subtract {y} and get {z}", "with {y} less we have {z}"),
+    "*": ("multiplying by {y} gives {z}", "we multiply by {y} and get {z}"),
+}
+NEXT = ("Then", "Next,", "After that,", "Now")
+LAST = ("Finally,", "Last,", "At the end,")
+LEFT_TO_RIGHT = ("There are only additions and subtractions, so we go from left to right.",
+                 "We work from left to right, one number at a time.",
+                 "We take the numbers in order, from left to right.")
+BRACKETS = ("The part in brackets comes first:", "We start with the brackets:",
+            "First we work out what is inside the brackets:")
+PRECEDENCE = ("Multiplication comes before addition and subtraction, so first",
+              "We multiply before we add or subtract:", "The multiplication goes first:")
+CLOSE = ("So the answer is {z}.", "That means the answer is {z}.", "The answer is {z}.")
+
+
+def _steps_with_reasons(text: str) -> tuple[list[tuple[int, str, int, int, str | None, bool]], int]:
+    """(left, op, right, value, reason, continues) for every operation, in evaluation order.
+
+    reason is "brackets" for a step written inside brackets, "precedence" for a multiplication
+    done before the addition or subtraction around it, else None. continues is True when the
+    step's left side is the result of the step just before it.
+    """
+    found = []
+
+    def walk(node, parent_op=None):
+        if isinstance(node, ast.Constant):
+            return node.value, False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            value, _ = walk(node.operand)
+            return -value, False
+        left, left_is_step = walk(node.left, node.op)
+        before = len(found)
+        right, _ = walk(node.right, node.op)
+        symbol, fn = OPS[type(node.op)]
+        value = fn(left, right)
+        start, end = node.col_offset, node.end_col_offset
+        bracketed = start > 0 and text[start - 1] == "(" and end < len(text) and text[end] == ")"
+        reason = ("brackets" if bracketed else
+                  "precedence" if symbol == "*" and isinstance(parent_op, (ast.Add, ast.Sub)) else None)
+        continues = left_is_step and len(found) == before  # nothing was computed on the right
+        found.append((left, symbol, right, value, reason, continues))
+        return value, True
+
+    value, _ = walk(ast.parse(text, mode="eval").body)
+    return found, value
+
+
+def _say(rng: random.Random, step) -> str:
+    left, symbol, right, value, _, continues = step
+    bank = RUNNING[symbol] if continues and rng.random() < 0.6 else SAY[symbol]
+    return rng.choice(bank).format(x=left, y=right, z=value)
+
+
+def words_for_expression(text: str, rng: random.Random) -> tuple[str, int]:
+    """An explanation in sentences, with why each step comes when it does."""
+    steps, value = _steps_with_reasons(text)
+    if not steps:
+        return f"It is just {value}.", value
+    if len(steps) == 1:
+        line = _say(rng, steps[0])
+        return line[0].upper() + line[1:] + ".", value
+    sentences = []
+    if not any(s[4] for s in steps) and all(s[1] in "+-" for s in steps):
+        sentences.append(rng.choice(LEFT_TO_RIGHT))
+    for index, step in enumerate(steps):
+        line = _say(rng, step)
+        if step[4] == "brackets" and not any(s[4] == "brackets" for s in steps[:index]):
+            sentences.append(f"{rng.choice(BRACKETS)} {line}.")
+        elif step[4] == "precedence":
+            lead = rng.choice(PRECEDENCE)
+            sentences.append(f"{lead} {line}." if lead.endswith(("first", ":")) else f"{lead}, {line}.")
+        elif index == 0:
+            sentences.append(f"First, {line}.")
+        else:
+            lead = rng.choice(LAST if index == len(steps) - 1 else NEXT)
+            sentences.append(f"{lead} {line}.")
+    return " ".join(sentences), value
+
+
+def words_for_variables(expression: str, rng: random.Random) -> tuple[str, int]:
+    """Level 8, "a = 7, b = a + 5; b": each letter in order, in sentences."""
+    assignments, target = expression.split(";")
+    values: dict[str, int] = {}
+    sentences = [rng.choice(("We work out each letter in order.", "We find the letters one by one.",
+                             "Let us go through the letters in order."))]
+    for part in assignments.split(","):
+        name, formula = (x.strip() for x in part.split("="))
+        if formula.lstrip("-").isdigit():
+            values[name] = int(formula)
+            sentences.append(rng.choice(("{n} is {v}.", "We are told {n} is {v}.", "{n} starts at {v}.")).format(
+                n=name, v=formula))
+            continue
+        spoken = " ".join(WORD_OPS.get(token, token) for token in formula.split())
+        known = [t for t in formula.split() if t.isalpha()]
+        filled = re.sub(r"[a-z]", lambda m: str(values[m.group()]), formula)
+        steps, value = explain_expression(filled)
+        values[name] = value
+        given = " and ".join(f"{t} is {values[t]}" for t in dict.fromkeys(known))
+        left, symbol, right = filled.split()
+        sentences.append(rng.choice((
+            "{n} is {s}. Since {g}, {calc}, so {n} is {v}.",
+            "{n} is {s}, and {g}, so {n} is {calc_short}.",
+            "For {n} we take {s}: {calc}. So {n} is {v}.",
+        )).format(n=name, s=spoken, g=given, v=value,
+                  calc=SAY[symbol][0].format(x=left, y=right, z=value),
+                  calc_short=f"{left} {WORD_OPS[symbol]} {right}, which is {value}"))
+    return " ".join(sentences), values[target.strip()]
+
+
+def explain_item(item: em.Item, rng: random.Random | None = None) -> str:
+    """The question, then an explanation in words, then "the answer is N"."""
+    rng = rng or random.Random(item.question)
+    body, value = (words_for_variables(item.expression, rng) if item.level == 8
+                   else words_for_expression(item.expression, rng))
     if value != item.answer:
         raise ValueError(f"explanation disagrees: {item.expression} gives {value}, not {item.answer}")
-    body = ". ".join(steps) + "." if steps else f"It is {value}."
-    return f"Q: {item.question} {EXPLAIN}\nA: {body} The answer is {value}."
+    return f"Q: {item.question} {EXPLAIN}\nA: {body} {rng.choice(CLOSE).format(z=value)}"
 
 
 def explain_prompt(item: em.Item) -> str:
@@ -92,7 +216,7 @@ def explain_prompt(item: em.Item) -> str:
 
 def answer_of(text: str) -> str | None:
     """The number after "The answer is", or None."""
-    found = re.search(r"The answer is (-?\d+)", text)
+    found = re.search(r"[Tt]he answer is (-?\d+)", text)
     return found.group(1) if found else None
 
 
@@ -170,11 +294,11 @@ def fill(t: dict, rng: random.Random, explain: bool) -> tuple[str, str, int]:
     context = re.sub(r"\{(\w+)\}", lambda m: words[m.group(1)], t["context"])
     question = re.sub(r"\{(\w+)\}", lambda m: words[m.group(1)], t["question"])
     filled = re.sub(r"\b[a-d]\b", lambda m: str(values[m.group()]), t["answer"])
-    steps, value = explain_expression(filled)
     if explain:
-        body = ". ".join(steps) + "." if steps else f"It is {value}."
-        tail = f"\nQ: {question} {EXPLAIN}\nA: {body} The answer is {value}."
+        body, value = words_for_expression(filled, rng)
+        tail = f"\nQ: {question} {EXPLAIN}\nA: {body} {rng.choice(CLOSE).format(z=value)}"
     else:
+        _, value = explain_expression(filled)
         tail = f"\nQ: {question}\nA: {value}"
     return context, tail, value
 
@@ -210,10 +334,11 @@ def build_explain(root: Path, tok: Tokenizer, seed: int, train_tokens: int, held
     counts = {}
     for split, target in (("train", train_tokens), ("val", held_tokens), ("test", held_tokens)):
         writer = Writer(root, "explain", split, labelled=False)
+        rng = random.Random(f"explain-words:{seed}:{split}")
         rounds = 0
         while writer.count < target:
             for batch in generate(split, 2_000, seed + 1000 * (rounds + 1), pools):
-                for enc, item in zip(tok.encode_batch([explain_item(i) for i in batch]), batch):
+                for enc, item in zip(tok.encode_batch([explain_item(i, rng) for i in batch]), batch):
                     if writer.count >= target:
                         break
                     writer.add([(enc.ids, 1)], eod)
