@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import tarfile
 import urllib.request
@@ -18,7 +19,9 @@ import torch
 # Every source the data builders write. Code is built but no longer trained or evaluated:
 # a model of this size is too small to learn code well.
 ALL_DATASETS = ("story", "maths", "code", "qa")
-DATASETS = ("story", "maths", "qa")  # what models train and are evaluated on
+# What models train and are evaluated on. SPIDORY_DATASETS adds the mixed-topic and explained
+# maths sets (see mixed_data.py), e.g. "story,maths,qa,mixed,explain"; it is read once at start.
+DATASETS = tuple(os.environ.get("SPIDORY_DATASETS", "story,maths,qa").split(","))
 SPLITS = ("train", "val", "test")
 MATH_URL = "https://storage.googleapis.com/mathematics-dataset/mathematics_dataset-v1.0.tar.gz"
 MATH_MODULES = (

@@ -99,6 +99,73 @@ def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, *
 
 
 @torch.no_grad()
+def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 160,
+                     **choice) -> float:
+    """Exact-answer rate when the model explains its steps first and ends with "The answer is N"."""
+    from .mixed_data import answer_of
+
+    device = next(model.parameters()).device
+    eod, correct = tok.token_to_id("[EOD]"), 0
+    for item in exam[:questions]:
+        prompt = tok.encode(item["prompt"]).ids
+        ids, found = list(prompt), None
+        for _ in range(longest):
+            window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
+            next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
+            if next_id == eod:
+                break
+            ids.append(next_id)
+            text = tok.decode(ids[len(prompt):])
+            if "\n" in text or text.rstrip().endswith("."):
+                found = answer_of(text)
+                if found is not None or "\n" in text:
+                    break
+        correct += found == item["answer"]
+    return correct / max(1, min(questions, len(exam)))
+
+
+@torch.no_grad()
+def mixed_topic_loss(model, corpus: Corpus, windows: int, chunk: int = 32, **choice) -> dict:
+    """Loss inside mixed-topic test texts, per topic of the predicted token."""
+    import numpy as np
+    import torch.nn.functional as F
+
+    from .mixed_data import TOPICS
+
+    model.eval()
+    device = next(model.parameters()).device
+    stream = corpus.tokens["mixed", "test"]
+    labels = np.memmap(corpus.root / "mixed.test.labels", dtype=np.uint8, mode="r")
+    starts = np.linspace(0, len(stream) - corpus.seq_len - 2, windows).astype(np.int64)
+    total, count = torch.zeros(len(TOPICS)), torch.zeros(len(TOPICS))
+    for begin in range(0, windows, chunk):
+        part = starts[begin:begin + chunk]
+        rows = torch.from_numpy(np.stack([stream[s:s + corpus.seq_len + 1] for s in part]).astype(np.int64)).to(device)
+        topic = torch.from_numpy(np.stack([labels[s + 1:s + corpus.seq_len + 1] for s in part]).astype(np.int64))
+        logits = model.infer(rows[:, :-1], **choice)[0]
+        loss = F.cross_entropy(logits.flatten(0, 1).float(), rows[:, 1:].flatten(), reduction="none").cpu()
+        topic = topic.flatten()
+        for name, index in TOPICS.items():
+            mask = topic == index
+            total[index] += loss[mask].sum()
+            count[index] += mask.sum()
+    return {name: round(float(total[i] / count[i].clamp(min=1)), 4) for name, i in TOPICS.items()}
+
+
+def extra_scores(model, corpus: Corpus, tok: Tokenizer, windows: int, questions: int, **choice) -> dict:
+    """Scores on the mixed-topic and explained-maths sets, when this corpus has them."""
+    root, found = Path(corpus.root), {}
+    if "mixed" in DATASETS and (root / "mixed.test.labels").exists():
+        found["mixed_topics"] = mixed_topic_loss(model, corpus, windows, **choice)
+        exam = json.loads((root / "mixed_exam.json").read_text())
+        found["mixed_accuracy"] = round(maths_accuracy(model, tok, exam, min(questions, len(exam)), **choice), 4)
+    if "explain" in DATASETS and (root / "explain_exam.json").exists():
+        exam = json.loads((root / "explain_exam.json").read_text())
+        found["explain_accuracy"] = round(explain_accuracy(model, tok, exam, min(questions, 120), **choice), 4)
+    return found
+
+
+@torch.no_grad()
 def cycle_loss(model, corpus: Corpus, windows: int) -> dict:
     """Loss per dataset with the training cycle: runs 1, 2, 3, 4, 1, ... across tokens."""
     from .train import cycle_ks
@@ -136,7 +203,7 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
         return {"loss": {k: round(v, 4) for k, v in losses.items()},
                 "mean_loss": round(sum(losses.values()) / len(losses), 4),
                 "maths_accuracy": (levels := accuracy_by_level(model, tok, exam, questions, **choice))["all"],
-                "maths_levels": levels}
+                "maths_levels": levels} | extra_scores(model, corpus, tok, windows, questions, **choice)
 
     cost = tflops_by_k(model.cfg)
     result["cycle"] = cycle_loss(model, corpus, windows)

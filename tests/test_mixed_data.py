@@ -1,0 +1,176 @@
+"""Mixed-topic data and explained maths: correct answers, honest splits, aligned labels."""
+import json
+import random
+from dataclasses import replace
+
+import numpy as np
+import pytest
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, decoders
+
+from spidory import data, evaluate, mixed_data as md
+from spidory import easy_maths as em
+from spidory.data_v2 import LEVELS, generate
+from spidory.model import Spidory
+
+from test_spidory import CFG
+
+GOOD = {"id": "s001", "kind": "story",
+        "context": "{name} had {a} shells. {name2} gave {name} {b} more and then {c} were lost.",
+        "question": "How many shells does {name} have now?", "answer": "a + b - c",
+        "vars": {"a": [5, 20], "b": [1, 9], "c": [0, 4]}}
+
+
+@pytest.fixture(scope="module")
+def tok():
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    text = ["Q: What is 3 + 4? Explain step by step.\nA: 3 + 4 = 7. The answer is 7.",
+            "Tom had 5 shells. Lily gave Tom 3 more. How many shells?", "\n\n",
+            "The town of Velmora built a bridge in 1820 with 300 stones."] * 50
+    tokenizer.train_from_iterator(text, trainers.BpeTrainer(vocab_size=300, special_tokens=["[UNK]", "[EOD]"],
+                                                             initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    return tokenizer
+
+
+@pytest.fixture(scope="module")
+def items():
+    pools = em._pools()
+    return {split: [i for batch in generate(split, 60, 0, pools) for i in batch] for split in ("train", "test")}
+
+
+def test_explanations_follow_the_operations():
+    assert md.explain_expression("14 + 7 - 18") == (["14 + 7 = 21", "21 - 18 = 3"], 3)
+    assert md.explain_expression("3 + 4 * 2") == (["4 * 2 = 8", "3 + 8 = 11"], 11)
+    assert md.explain_expression("(3 + 4) * 2") == (["3 + 4 = 7", "7 * 2 = 14"], 14)
+    steps, value = md.explain_variables("a = 7, b = a + 5, c = b - a; c")
+    assert value == 5 and steps == ["a = 7", "b = 7 + 5 = 12", "c = 12 - 7 = 5"]
+
+
+def test_every_level_explains_to_the_true_answer(items):
+    for item in items["train"] + items["test"]:
+        text = md.explain_item(item)
+        assert md.answer_of(text) == str(item.answer)
+        assert text.startswith(f"Q: {item.question} {md.EXPLAIN}\nA: ")
+    assert {i.level for i in items["train"]} == set(LEVELS)
+
+
+def test_explained_questions_keep_the_maths_split(items):
+    """Test expressions of the maths sets must never be explained in training."""
+    train = {i.expression for i in items["train"]}
+    assert not train & {i.expression for i in items["test"]}
+    for item in items["train"]:
+        if item.level not in (2, 5):
+            assert em._split_of(item.expression) == "train"
+
+
+def test_good_template_passes_and_bad_ones_are_refused():
+    md.check_template(GOOD)
+    bad = [
+        GOOD | {"answer": "a / b"},                                   # division
+        GOOD | {"answer": "a - b - 30"},                              # can go negative
+        GOOD | {"context": GOOD["context"] + " {place}"},             # unknown placeholder
+        GOOD | {"vars": {"a": [5, 20], "b": [1, 9]}},                 # c has no range
+        GOOD | {"answer": "__import__('os')"},                        # not arithmetic
+        GOOD | {"kind": "poem"},
+    ]
+    for template in bad:
+        with pytest.raises((ValueError, SyntaxError)):
+            md.check_template(template)
+
+
+def test_loading_drops_bad_lines_and_duplicates(tmp_path):
+    lines = [json.dumps(GOOD), "not json", json.dumps(GOOD), json.dumps(GOOD | {"id": "s002", "answer": "a / b"})]
+    (tmp_path / "story_1.jsonl").write_text("\n".join(lines))
+    found, dropped = md.load_templates(tmp_path)
+    assert [t["id"] for t in found] == ["s001"] and len(dropped) == 3
+
+
+def test_filled_answers_are_computed():
+    rng = random.Random(0)
+    for explain in (False, True):
+        for _ in range(50):
+            context, tail, value = md.fill(GOOD, rng, explain)
+            numbers = [int(n) for n in __import__("re").findall(r"\d+", context)]
+            assert value == numbers[0] + numbers[1] - numbers[2]
+            assert "{" not in context + tail
+            assert tail.endswith(f"The answer is {value}." if explain else f"A: {value}")
+
+
+def test_template_splits_are_stable_and_held_out():
+    ids = [f"s{i:03d}" for i in range(300)]
+    splits = [md._split_of_id(i) for i in ids]
+    assert splits == [md._split_of_id(i) for i in ids]
+    assert 15 <= splits.count("test") <= 50 and 15 <= splits.count("val") <= 50
+
+
+def _streams(root, tok):
+    """Story, maths and qa splits whose tokens show their topic: 10-19, 20-29 and 30-39."""
+    eod = tok.token_to_id("[EOD]")
+    for index, name in enumerate(("story", "maths", "qa")):
+        for split in data.SPLITS:
+            rng = np.random.default_rng(index)
+            docs = [np.append(rng.integers(10 * (index + 1), 10 * (index + 2), rng.integers(30, 200)), eod)
+                    for _ in range(80)]
+            np.concatenate(docs).astype(np.uint16).tofile(root / f"{name}.{split}.bin")
+
+
+def _templates():
+    found = []
+    for i in range(60):
+        kind = "story" if i % 2 else "fact"
+        found.append(GOOD | {"id": f"{kind[0]}{i:03d}", "kind": kind})
+    return found
+
+
+def test_mixed_documents_have_aligned_labels(tmp_path, tok):
+    _streams(tmp_path, tok)
+    counts = md.build_mixed(tmp_path, tok, _templates(), 0, 40_000, 8_000, exam_size=20)
+    gap = set(tok.encode("\n\n").ids)
+    for split in ("train", "test"):
+        ids = np.fromfile(tmp_path / f"mixed.{split}.bin", dtype=np.uint16)
+        labels = np.fromfile(tmp_path / f"mixed.{split}.labels", dtype=np.uint8)
+        assert len(ids) == len(labels) == counts[split]
+        eod = tok.token_to_id("[EOD]")
+        assert ((ids == eod) == (labels == md.END)).all()
+        # Joined pieces keep their topic: a token from the story range is labelled story, and so on.
+        for topic, low in ((0, 10), (1, 20), (2, 30)):
+            inside = (ids >= low) & (ids < low + 10) & ~np.isin(ids, list(gap))
+            assert inside.any() and (labels[inside] == topic).mean() > 0.6
+        docs = np.split(labels, np.flatnonzero(labels == md.END) + 1)
+        assert sum(len(set(d[d != md.END].tolist())) > 1 for d in docs if len(d) > 1) > len(docs) * 0.6
+    exam = json.loads((tmp_path / "mixed_exam.json").read_text())
+    assert len(exam) == 20 and all(e["prompt"].endswith("A:") for e in exam)
+    assert any(e["lead"] for e in exam) and not all(e["lead"] for e in exam)
+
+
+def test_explain_dataset_and_exam(tmp_path, tok):
+    counts = md.build_explain(tmp_path, tok, 0, 20_000, 4_000, exam_per_level=5)
+    assert counts["train"] >= 20_000
+    exam = json.loads((tmp_path / "explain_exam.json").read_text())
+    assert len(exam) == 5 * len(LEVELS) and all(e["prompt"].endswith(f"{md.EXPLAIN}\nA:") for e in exam)
+    text = tok.decode(np.fromfile(tmp_path / "explain.train.bin", dtype=np.uint16)[:400].tolist())
+    assert "The answer is" in text
+
+
+def test_evaluation_scores_mixed_topics_and_exams(tmp_path, tok, monkeypatch):
+    _streams(tmp_path, tok)
+    md.build_mixed(tmp_path, tok, _templates(), 0, 20_000, 6_000, exam_size=6)
+    md.build_explain(tmp_path, tok, 0, 6_000, 3_000, exam_per_level=1)
+    names = ("story", "maths", "qa", "mixed", "explain")
+    monkeypatch.setattr(data, "DATASETS", names)
+    monkeypatch.setattr(evaluate, "DATASETS", names)
+    corpus = data.Corpus(tmp_path, CFG.seq_len)
+    batch = corpus.train_batch(8)
+    assert batch.shape == (8, CFG.seq_len + 1)
+    model = Spidory(replace(CFG, vocab_size=tok.get_vocab_size()))
+    found = evaluate.extra_scores(model, corpus, tok, 4, 3, k=2)
+    assert set(found["mixed_topics"]) == {"story", "maths", "qa"}
+    assert all(np.isfinite(v) for v in found["mixed_topics"].values())
+    assert 0 <= found["mixed_accuracy"] <= 1 and 0 <= found["explain_accuracy"] <= 1
+
+
+def test_answer_reader():
+    assert md.answer_of("3 + 4 = 7. The answer is 7.") == "7"
+    assert md.answer_of("2 - 9 = -7. The answer is -7.") == "-7"
+    assert md.answer_of("no answer here") is None
