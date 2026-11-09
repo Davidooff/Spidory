@@ -118,7 +118,9 @@ def run_rounds(model, optimizer, corpus: Corpus, tcfg, rcfg: RoundConfig, start:
     schedule = [(p, i) for p in range(rcfg.passes) for i in range(len(DATASETS))]
     for number, index in schedule[schedule.index(resume) if resume in schedule else len(schedule):]:
         dataset = DATASETS[index]
-        round_seed = seed + 1000 * (number + 1) + index
+        # A large stride per seed keeps seeds apart (seed 0 is unchanged): before, seed 1 reused
+        # seed 0's next round seed in 6 of every 7 rounds.
+        round_seed = seed * 100_003 + 1000 * (number + 1) + index
         stop = step + rcfg.steps
         windows = tcfg.eval_windows
 
