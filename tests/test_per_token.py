@@ -191,3 +191,17 @@ def test_experts_read_the_state_left_by_the_one_before():
         if w.any():
             h = unit(h + w * expert.alpha() * (expert.proposal(h) - h))
     assert torch.allclose(out, unit(h), atol=1e-6)
+
+
+def test_without_per_loop_each_token_keeps_its_expert_in_every_run():
+    """token_signal_once: experts are chosen per token once, before the first run."""
+    batch = tokens(2)
+    for per_loop in (False, True):
+        model = woken(replace(TOKEN, route_per_loop=per_loop, run_signal=True))
+        model._route_record = []
+        _, experts, _ = model.infer(batch, k=4)
+        paths = torch.stack(model._route_record)  # (runs, batch, tokens)
+        model._route_record = None
+        assert torch.equal(paths[0], experts)
+        unchanged = bool((paths == paths[0]).all())
+        assert unchanged != per_loop  # once: same expert every run; per loop: it changes somewhere

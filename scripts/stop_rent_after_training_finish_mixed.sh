@@ -49,9 +49,23 @@ fi
 COPY_SIGNAL=$!
 trap 'kill $COPY_SIGNAL 2>/dev/null' EXIT
 for attempt in 1 2 3 4 5; do
-  rsync -az --partial --timeout=120 --exclude LAPTOP_COPYING --exclude backup_to_hub.log -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
+  timeout 7200 rsync -az --partial --timeout=120 --exclude LAPTOP_COPYING --exclude backup_to_hub.log -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
   say "copy attempt $attempt failed"
-  [ "$attempt" = 5 ] && stop_keep "copy failed" 7
+  if [ "$attempt" = 5 ]; then
+    # The machine may have ended itself after its verified Hub backup. Restore from the Hub instead.
+    if [ -n "${HUB_MACHINE:-}" ] && .venv/bin/python scripts/restore_from_hub.py --repo Davidow/spidory-runs \
+         --machine "$HUB_MACHINE" --out "$LOCAL" >> "$LOG" 2>&1; then
+      say "restored from the Hub and verified"
+      if vastai show instances --raw 2>/dev/null | python3 -c "import sys,json; sys.exit(0 if any(i['id']==$INSTANCE for i in json.load(sys.stdin)) else 1)"; then
+        label=$(vastai show instance "$INSTANCE" --raw 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('label'))")
+        [ "$label" = spidory ] || stop_keep "instance label is $label" 12
+        vastai destroy instance "$INSTANCE" -y --raw 2>&1 | tail -1 | tee -a "$LOG"
+      fi
+      say "rental ended (or already gone), data verified from the Hub in $LOCAL"
+      exit 0
+    fi
+    stop_keep "copy failed" 7
+  fi
 done
 
 differences=$(rsync -anc --timeout=300 --exclude LAPTOP_COPYING --exclude backup_to_hub.log --itemize-changes -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" 2>&1)
@@ -72,7 +86,7 @@ fi
 [ -z "$(printf '%s' "$differences" | grep '^[>c]')" ] || stop_keep "local copy differs: $differences" 9
 [ -n "$remote_files" ] && [ "$local_files" -ge "$remote_files" ] || stop_keep "file count mismatch" 10
 if [ -f "$LOCAL/DONE" ]; then
-  [ -s "$LOCAL/results_between.json" ] || say "WARNING: results_between.json is missing; checkpoints are copied, so it can be evaluated later"
+  ls "$LOCAL"/results_*.json >/dev/null 2>&1 || say "WARNING: no results_*.json; checkpoints are copied, so they can be evaluated later"
 fi
 
 label=$(vastai show instance "$INSTANCE" --raw 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('label'))")

@@ -24,6 +24,7 @@ VERSIONS=(
   "perloop:--route-per-loop:$NEURON"
   "token:--route-per-token --route-per-loop:$NEURON"
   "token_signal:--route-per-token --route-per-loop --run-signal:$NEURON"
+  "token_signal_once:--route-per-token --run-signal:$NEURON"  # experts chosen per token once, kept in every run
   "between_signal:--between-layers 6 --between-mode shared --run-signal:$NEURON"
 )
 WANTED=",${2:-all},"
