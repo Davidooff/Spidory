@@ -2,7 +2,8 @@
 
 The full record of what was built, trained and tested, and every problem along the way.
 For a short summary per version, see `TRAINING_VERSIONS.md`. All held-out numbers here come
-from splits that training never saw. Dates are 2026-11-07 unless stated.
+from splits that training never saw. Dates are 2026-11-07 unless stated. Last updated 2026-11-09,
+after the v4 cycle.
 
 ## 1. The idea
 A Dory-style looped transformer (NVIDIA Dory1.0-4B, `~/Downloads/2611.03998v1.pdf`):
@@ -38,6 +39,15 @@ s + run-count signal + expert signal → OUTPUT 4 layers → tied embedding → 
 - **Branch `arch-between`:** a between block (6 layers) runs between centre runs. It's either
   shared, separate per gap, or per gap with a learned merge of the input (with or without
   boundary normalization).
+- **Branch `run-signal-per-token` (v4):**
+  - **Run signal** (`--run-signal`, the user's idea): before run k the centre gets
+    `u = N(a_k·s + b_k·x + e_k)`, with per-channel weights and a vector for each run number.
+    It starts at `a = b = 1, e = 0`, which is exactly Dory. Each expert also gets a vector per
+    run, and a between block gets one per gap. `--no-boundary-norm` drops the `N(...)`.
+  - **Per-token routing** (`--route-per-token`): the router and the run neuron read each
+    token's own state, so every token gets its own expert per run and its own run count. A
+    token is charged for as many runs as any later token, because their attention reads its
+    state on every run.
 
 ## 3. Training procedure as it stands now
 | Stage | What happens |
@@ -67,7 +77,22 @@ with gradients added before one update.
 | v1 easy maths (v2 run) | 81.6M | 60M generated, 5 easy levels | 40.4M | 23.4M | 205M |
 | v2 (v3 attempt 1) | 81.6M | 120M, levels 2 and 5-9 | 40.4M | 171M (+HotpotQA, NQ, Simple Wikipedia) | 413M |
 | v3 | 406M (more TinyStories) | 120M | 159M (all 4 CSN Python files) | 171M | 856M |
-| v4 (current runs) | 1,009M (+TinyStories V2) | 240M | 718M (+CSN JS, Java, Go, MIT Python set) | 1,011M (+4 Wikipedia files) | 2,978M |
+| v4 | 1,009M (+TinyStories V2) | 240M | 718M (+CSN JS, Java, Go, MIT Python set) | 1,011M (+4 Wikipedia files) | 2,978M |
+| v5 (v3 cycle) | 956M, leak-filtered | 240M | dropped | 998M, leak-filtered | 2,194M |
+| v6 (v4 cycle) | as v5 | as v5 | dropped | as v5 | 3,340M with the 4 sets below |
+
+**New sets in data v6** (`spidory/mixed_data.py`), each a seventh of every batch:
+- **Mixed topics, 600M:** half are joins of pieces from different sets, half are stories or
+  encyclopedia passages with an inserted problem. A cheap-model subagent wrote 739 plot templates.
+  Code fills in the numbers and checks every answer. Templates are split 597 / 73 / 69 into
+  train / val / test, with near-duplicates kept in one split.
+- **Maths explained in words, 300M:** a problem, then a solution in plain sentences giving the
+  reason for each step, ending "the answer is N".
+- **Compose, 200M:** asks for a story problem with given numbers and answer, an expression with
+  a given result, or a question with a given answer. Replies are graded by computing.
+- **Word problems, 46M:** Orca-Math 200k and GSM8K train (both MIT). GSM8K test is the exam.
+  3,724 problems sharing an 8-word passage with the exam and 53,605 longer than 512 tokens were
+  dropped. SVAMP was dropped, as it overlaps training data.
 
 **Maths levels in data v2 and later:**
 - **Level 2:** one operation, 1-2 digits.
@@ -92,8 +117,9 @@ not filtered. Data v5 fixes this (section 8).
 | v2 | Plain 23.6M, 4/10/4 layers, width 320 | v1 easy maths | 60,000 | Vast Vietnam | Early check failed: -0.54% loss, +1.2 maths points. QA overfit (held-out loss 5.27). |
 | v2-100M | Experts 102.4M, width 672, 4 experts | v1 + grown story and code | 128,000 | Vast Pennsylvania | Finished. Post-hoc run neuron beat every fixed `k`. |
 | v3 attempt 1 | Plain 23.6M | v2 | 48,000 | Vast Poland | Early check failed narrowly. Every dataset gained at `k = 2`, but none by 1%. |
-| v3 | 7 models, nGPT, 2 seeds | v4 | 54,000 + rounds | Vast Quebec, Malaysia | Running. |
-| between | 4 between-block versions | v4 | 54,000 + rounds | Vast Malaysia | Running. |
+| v3 | 8 models, nGPT, 2 seeds | v5 | 73,200 | Vast, 3 machines | Finished. Neuron beat the best fixed `k` in 4 of 14 tries, none repeated on the other seed. |
+| between | 4 between-block versions, seed 0 | v5 | 73,200 | Vast | Finished. 0.6% worse loss than Plain, better maths. |
+| v4 | 7 models: run signal, per-token routing, seed 0 | v6 | 73,180 | Vast Quebec, Oregon, California | Finished. Run signal helps; best is per-token + run signal. |
 
 ### v1.1 test loss (Plain 4.1M)
 | `k` | Story | Maths | Code | QA |
@@ -159,6 +185,48 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
 | Neuron mix | 132 / 141 | 7.7 GB |
 | Two experts | 131 / 137 | 7.8 GB |
 
+### v3 and between block, test (seed 0 / seed 1)
+The full tables, with every neuron test and round, are in the report artifact
+(https://claude.ai/artifact/DrpnN2ih7TmFuriKtiUvUi, sections 8.1-8.6).
+
+| Model | `k = 3` loss | Neuron loss | Maths `k = 3` |
+|---|---:|---:|---:|
+| Plain | 1.894 / 1.885 | - | 81.8% / 82.6% |
+| Constant | 1.903 / 1.895 | - | 81.8% / 77.4% |
+| Neuron net, sampled | 1.896 / 1.896 | 1.897 / 1.890 | 83.0% / 74.8% |
+| Neuron net, average | 1.896 / 1.886 | 1.896 / 1.886 | 81.6% / 79.6% |
+| Per-loop routing | 1.893 / 1.893 | 1.893 / 1.892 | 87.4% / 85.8% |
+| Between, per gap (seed 0) | 1.906 | 1.899 | 87.4% |
+| Between, shared (seed 0) | 1.928 | 1.928 | 75.8% |
+
+### v4 test results (seed 0, data v6)
+Loss is the mean over 7 sets, so it doesn't compare with v3's 3-set mean. Runs paid counts what
+per-token models really compute.
+
+| Model | Params | `k = 1` | `k = 3` | Neuron | Runs paid | Maths `k = 3` | Explain | Compose | GSM8K |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Plain | 26.06M | 1.730 | 1.706 | - | - | 61.2% | 93.9% | 56.0% | 0.7% |
+| Plain + run signal | 26.07M | 1.712 | 1.698 | - | - | 73.6% | 97.8% | 54.0% | 1.3% |
+| Run signal, no boundary norm | 26.07M | 1.724 | 1.714 | - | - | 67.2% | 95.0% | 56.7% | 2.0% |
+| Per-loop routing | 26.64M | 1.841 | 1.808 | 1.807 | 2.89 | 56.6% | 92.2% | 51.3% | 2.0% |
+| Per-token routing | 26.64M | 1.746 | 1.716 | 1.715 | 3.00 | 66.0% | 93.3% | 58.7% | 1.3% |
+| **Per-token + run signal** | 26.65M | 1.717 | **1.696** | **1.696** | 3.00 | **82.4%** | 96.7% | 59.3% | 2.7% |
+| Between (shared) + run signal | 34.90M | 1.773 | 1.742 | 1.740 | 2.54 | 74.4% | 83.3% | 62.0% | 2.0% |
+
+Explain (180 problems), compose (150) and GSM8K (150) are at `k = 3`. The inserted-problem
+exam in the mixed set scores 11-19% for every model.
+
+Neuron fair test (difference from the best fixed `k`, 95% interval):
+- per-loop: +0.0011 [+0.0007, +0.0014], against `k = 2`, which is cheaper
+- per-token: -0.0003 [-0.0006, +0.00003] at equal compute
+- per-token + signal: +0.0003 [+0.0002, +0.0005]
+- between + signal: +0.0014 [+0.0010, +0.0018]
+
+No win. Dataset-expert information: per-loop 0.41 bits, between 0.49, per-token 0.008 and 0.021
+(shuffled baseline 0.000-0.004). Per-loop sends all 512 maths sequences to one expert, whose
+target rose to 3.5. Per-token models load all 4 experts almost evenly on every set, so rounds
+almost never form a group (1-2 of 14) and their targets stay at 2.5.
+
 ## 6. What the results say so far
 - **Loops help only a little:** about 0.4-0.9% at 24M, and up to 1.35% (story) and 1.04% (code)
   at 100M, where story and code were best at 3 runs. That costs about 1.5 times the compute at
@@ -180,10 +248,26 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
   to 3.0).
 - **Rounds grouped by measured gain never formed a group,** because gains were too small. The
   user's rule, grouping by activation alone, is what v3 now uses.
+- **v3 (2 seeds):** loops give about 2.2% at double compute, almost all from the second run.
+  Experts specialise without labels but are 0.5% worse than Plain. The neuron beat the best fixed
+  `k` in 4 of 14 tries, never on both seeds, and beat `k` per dataset once, by 0.01%.
+- **v4, run signal (the user's idea): yes.** In both models it was added to it improved loss and
+  maths: Plain 1.706 → 1.698 and 61.2% → 73.6%, per-token 1.716 → 1.696 and 66.0% → 82.4%. It
+  helps already at `k = 1`. Without boundary normalization it's worse than with it (1.714), so it
+  works as an addition, not a replacement.
+- **v4, per-token routing beats per-loop routing by 5.4%** on 7 sets (1.716 vs 1.808), though
+  per-loop was the best v3 model on 3 sets. Per-token experts don't follow topics (0.02 bits),
+  and per-token run choice saves no compute, since nearly every window has a later token
+  choosing 3.
+- **v4, more sets cost the old ones:** on story, maths and QA, Plain is 8% worse than v3 Plain
+  (2.044 vs 1.894 mean) and maths fell from 81.8% to 61.2%, as each old set now gets 1/7 of a
+  batch instead of 1/3. GSM8K stays at 0-4% for every model.
+- **The between block lost again** (1.742 vs 1.698 for Plain + signal, with 34% more
+  parameters).
 
 ## 7. Tests
-- **Test count:** grew from 20 to 109 on `main`, and 137 on `arch-between`, with the full suite
-  run before every remote step.
+- **Test count:** grew from 20 to 109 on `main`, 211 on `arch-between` and 260 on
+  `run-signal-per-token`, with the full suite run before every remote step.
 
 | File | What it checks |
 |---|---|
@@ -193,6 +277,9 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
 | `tests/test_cycle.py` | The cycle goes up by one per token; per-token and per-sequence counts match; finished tokens keep their state; each token learns from its own last run; pieces give the same update as one batch. |
 | `tests/test_data_v2.py`, `tests/test_easy_maths.py` | Every answer correct by independent evaluation, no split overlap, all levels present, deterministic generation. |
 | `tests/test_ui.py` | Playground settings, frozen run counts respected, refusing a neuron where none exists, columns progressing side by side. |
+| `tests/test_run_signal.py` (v4) | The signal starts exactly as Dory; each run reads its own row and only the last run's row learns; the between block learns its gap vector; works without boundary normalization; runs past the maximum reuse the last row; cycle and grouped inference agree; the joint neuron trains; every stage trains and reloads. |
+| `tests/test_per_token.py` (v4) | Routing is per token and sees past the prefix; tokens can use different experts; inference uses each token's own choices; fixed runs, average and expert lock; the joint step trains router, neuron and experts; mix is refused; the neuron moves toward lower-loss runs; compute counts every expert and is charged for later tokens; the run choice doesn't look ahead; the loss table works; each expert reads the state the one before left. |
+| `tests/test_mixed_data.py` (v4) | Explanations follow the operations, reach the true answer and read as sentences; bad templates are refused; filled answers are computed; template splits are stable and near-duplicates share a split; mixed labels align; exams stay out of training, including rewrites with new numbers; graders compute replies and refuse trivial ones; replies finish before generation stops. |
 | `tests/test_between.py`, `tests/test_merge.py` (branch) | Between block runs `k - 1` times; per-gap vs shared; only the last between block learns; the merge starts as `s + x`; boundary normalization can be removed; all paths work in both versions. |
 
 ## 8. Problems, step by step
@@ -290,6 +377,51 @@ v3 uses 6e-3: bigger models and longer runs usually need a lower rate than this 
     at 3-4 runs", the dataset pattern, and the neuron's advantage. The v1.1 per-dataset table and
     its 2.7% maths accuracy came from a laptop evaluation that wasn't saved to a file.
 
+### v3 cycle
+44. **Router collapse (run 2):** the old balance penalty made router probabilities equal, so
+    argmax sent every sequence to one expert. Replaced by the Switch Transformer penalty plus a
+    sharpening penalty.
+45. **Router logits saturated:** gaps of 1,400-5,600 where 5-10 suffice, a side effect of the
+    sharpening penalty. Still open (z-loss is the proposed fix).
+46. **My wrong claim** that the between block tripled the loop gain: I compared validation
+    loss before rounds with test loss after rounds. Corrected in the chat and the report.
+47. **My wrong count:** the between machine trained 4 versions, not 2. Corrected.
+48. **SSH inside a read loop** consumed the loop's input, so only the first machine was checked.
+    Fixed with `ssh -n`.
+49. **`pkill` matched my own command** and stopped it. Separate commands and PIDs are used now.
+50. **The playground loaded the laptop's older code** from the current folder instead of the
+    branch. It now runs from the branch folder with `--root`.
+51. **A report publish was refused** for a newer live version that differed only in its wrapper.
+    Republished after checking.
+
+### v4 cycle
+52. **Explanations were symbolic steps at first.** The user asked for words; rewritten as plain
+    sentences with the reason for each step.
+53. **The end-of-rental script matched itself again,** on the `grow_v4` pattern. Fixed with the
+    bracket trick.
+54. **Compose leaked exam expressions** into training. Training items that would show an exam
+    expression are now redrawn.
+55. **SVAMP overlapped training data.** Dropped from the exams.
+56. **The compose story exam always scored 0,** because of how its items were indexed. Fixed.
+57. **Answers like 5.0 failed against 5.** Answers are now compared as numbers.
+58. **Per-token compute was undercounted:** a token must run as often as any later token. It's
+    now charged the suffix maximum.
+59. **The loss table crashed** for per-token models. Fixed.
+60. **The expert input changed for old models** (it was computed once before the loop). Each
+    expert now reads the current state, as before.
+61. **Per-token choice noise was not causal:** it depended on later tokens. It's now a hash of
+    the token and its position.
+62. **The information baseline shuffled whole sequences,** not windows. Fixed.
+63. **The compose grader could be gamed,** for example by repeating the asked numbers. It's now
+    stricter.
+64. **Near-duplicate templates crossed splits.** Templates are clustered before splitting.
+65. **Generation caps cut off long answers.** Raised to 220-300 tokens.
+66. **The first v4 launch trained on leaked data** (items 54-55). It was stopped after about 1.5
+    hours, moved to `runs/*_leak_run`, and restarted on rebuilt data.
+67. **The Plain machine destroyed itself** after its Hub backup, while the laptop copy hung for
+    2.5 hours on a dead connection. The files were restored from Hugging Face and every checkpoint
+    loaded.
+
 Still open, from the review:
 - Single seeds so far.
 - No compute-matched model without loops.
@@ -300,9 +432,10 @@ Still open, from the review:
 ## 9. Costs
 - **Before the current runs:** about $6.40 of Vast credit, across 11 rentals, including several
   replaced within minutes.
-- **Current runs:** 3 RTX 4090s at about $1.35 per hour. The first start (about 1.5 hours) was
-  stopped after the review found the expert bug. The clean restart is expected to take about
-  16-19 hours, so about $24.
+- **v3 cycle and between block:** about $39 across 3 RTX 4090s, including the two stopped
+  starts.
+- **v4 cycle:** $22.12 (credit $44.97 → $22.85), including the stopped leaked start.
+- **Project total:** about $67.
 - **Budget:** the original $10 limit was removed by the user on 2026-11-07.
 
 ## 10. Where things are
@@ -310,5 +443,9 @@ Still open, from the review:
 - **`arch-between`:** the between-block architecture and its run scripts.
 - **Results on the laptop:**
   - `runs/remote`, `runs/remote_big`, `runs/remote_100m`, `runs/remote_v3`
-  - current runs go to `runs/remote_v3_s0`, `runs/remote_v3_s1` and `runs/remote_between`
-- **Dashboard:** https://claude.ai/artifact/YFv3h5vffvVQHrpUU8pJ7v (shows the 100M results so far)
+  - v3: `runs/remote_v3_s0`, `runs/remote_v3_s1`, `runs/remote_between`
+  - v4: `runs/remote_mixed_plain`, `runs/remote_mixed_perloop_between`, `runs/remote_mixed_token`
+  - a backup of every run is on Hugging Face (`Davidow/spidory-runs`, private)
+- **Branch `run-signal-per-token`:** v4 code, data v6 and `scripts/run_mixed.sh`.
+- **Report:** https://claude.ai/artifact/DrpnN2ih7TmFuriKtiUvUi
+- **Older dashboard:** https://claude.ai/artifact/YFv3h5vffvVQHrpUU8pJ7v (100M results)
