@@ -47,6 +47,11 @@ def main() -> int:
             (lfs or {}).get("sha256") if isinstance(lfs, dict) else None)
         if target.stat().st_size != entry.size or (digest and sha256(target) != digest):
             problems.append(relative)
+    on_hub = {e.path[len(args.machine) + 1:] for e in entries}
+    extra = sorted(p.relative_to(out).as_posix() for p in out.rglob("*")
+                   if p.is_file() and ".rsync-partial" not in p.parts and p.relative_to(out).as_posix() not in on_hub)
+    if extra:  # e.g. numbered checkpoints, which the Hub never holds; copied whole or kept aside by rsync
+        print(f"{len(extra)} local files are not on the Hub (not checked): {extra[:8]}")
     print(f"restored {len(entries)} files, {len(problems)} differ: {problems[:5]}")
     return 0 if not problems else 1
 

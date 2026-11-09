@@ -14,6 +14,29 @@ SSH="timeout 60 ssh -q -n -p $PORT -o ConnectTimeout=20 -o ServerAliveInterval=1
 RSH="ssh -q -p $PORT -o ConnectTimeout=20 -o ServerAliveInterval=15"
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$LOG"; }
 stop_keep() { say "KEEPING RENTAL: $1"; exit "$2"; }
+# 0: the instance is listed, 1: it is not listed, 2: the listing failed (treated as "still there").
+listed() {
+  local out
+  out=$(vastai show instances --raw 2>/dev/null) || return 2
+  [ -n "$out" ] || return 2
+  printf '%s' "$out" | python3 -c "import sys,json; sys.exit(0 if any(i['id']==$INSTANCE for i in json.load(sys.stdin)) else 1)" 2>/dev/null
+  local code=$?
+  [ "$code" -le 1 ] && return "$code" || return 2
+}
+# When the machine is gone (it ends itself after a verified Hub backup), restore from the Hub.
+# Never destroys anything: a machine that is still listed is left to its own backup script.
+hub_fallback() {
+  listed; local state=$?
+  [ "$state" = 1 ] || stop_keep "$1, and the machine is still listed (or the listing failed); not restoring" "$2"
+  [ -n "${HUB_MACHINE:-}" ] || stop_keep "$1, the machine is gone and no HUB_MACHINE is set" "$2"
+  if .venv/bin/python scripts/restore_from_hub.py --repo Davidow/spidory-runs --machine "$HUB_MACHINE" \
+       --out "$LOCAL" >> "$LOG" 2>&1; then
+    say "machine already gone; restored from the Hub and verified in $LOCAL"
+    exit 0
+  fi
+  say "MACHINE GONE AND HUB RESTORE FAILED: check $LOG"
+  exit "$2"
+}
 
 mkdir -p "$LOCAL"
 if [ "$CHECK_ONLY" != "--check" ]; then
@@ -49,35 +72,21 @@ fi
 COPY_SIGNAL=$!
 trap 'kill $COPY_SIGNAL 2>/dev/null' EXIT
 for attempt in 1 2 3 4 5; do
-  timeout 7200 rsync -az --partial --timeout=120 --exclude LAPTOP_COPYING --exclude backup_to_hub.log -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
+  timeout 1800 rsync -az --partial-dir=.rsync-partial --timeout=120 --exclude LAPTOP_COPYING --exclude backup_to_hub.log --exclude .rsync-partial -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" && break
   say "copy attempt $attempt failed"
-  if [ "$attempt" = 5 ]; then
-    # The machine may have ended itself after its verified Hub backup. Restore from the Hub instead.
-    if [ -n "${HUB_MACHINE:-}" ] && .venv/bin/python scripts/restore_from_hub.py --repo Davidow/spidory-runs \
-         --machine "$HUB_MACHINE" --out "$LOCAL" >> "$LOG" 2>&1; then
-      say "restored from the Hub and verified"
-      if vastai show instances --raw 2>/dev/null | python3 -c "import sys,json; sys.exit(0 if any(i['id']==$INSTANCE for i in json.load(sys.stdin)) else 1)"; then
-        label=$(vastai show instance "$INSTANCE" --raw 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('label'))")
-        [ "$label" = spidory ] || stop_keep "instance label is $label" 12
-        vastai destroy instance "$INSTANCE" -y --raw 2>&1 | tail -1 | tee -a "$LOG"
-      fi
-      say "rental ended (or already gone), data verified from the Hub in $LOCAL"
-      exit 0
-    fi
-    stop_keep "copy failed" 7
-  fi
+  [ "$attempt" = 5 ] && hub_fallback "copy failed" 7
 done
 
-differences=$(rsync -anc --timeout=300 --exclude LAPTOP_COPYING --exclude backup_to_hub.log --itemize-changes -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" 2>&1)
+differences=$(rsync -anc --timeout=300 --exclude LAPTOP_COPYING --exclude backup_to_hub.log --exclude .rsync-partial --itemize-changes -e "$RSH" "root@$HOST:/workspace/Spidory/runs/" "$LOCAL/" 2>&1)
 code=$?
-[ "$code" -eq 0 ] || stop_keep "verify failed with code $code" 8
+[ "$code" -eq 0 ] || hub_fallback "verify failed with code $code" 8
 remote_files=
 for attempt in 1 2 3 4 5 6; do
   remote_files=$($SSH 'find /workspace/Spidory/runs -type f -not -name LAPTOP_COPYING -not -name backup_to_hub.log | wc -l' 2>/dev/null | tail -1)
   [ -n "$remote_files" ] && break
   sleep 10
 done
-local_files=$(find "$LOCAL" -type f -not -name LAPTOP_COPYING -not -name backup_to_hub.log | wc -l)
+local_files=$(find "$LOCAL" -type f -not -name LAPTOP_COPYING -not -name backup_to_hub.log -not -path '*/.rsync-partial/*' | wc -l)
 say "remote files: $remote_files, local files: $local_files"
 if [ "$CHECK_ONLY" = "--check" ]; then
   say "check only, changed files: $(printf '%s' "$differences" | grep -c '^[>c]')"
