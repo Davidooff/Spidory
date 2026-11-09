@@ -11,18 +11,23 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from ..config import ModelConfig
+from ..evaluate import answer_item
 from ..flops import tflops_by_k
 from ..model import Spidory
+from .exams import EXAMS, Exams
 
 PAGE = Path(__file__).with_name("index.html")
 EXTRA_RUNS = 8  # frozen runs may go past training's max_runs, up to this, to test extrapolation
 GROUPS = {  # folder under runs/ -> how the page groups its models, in this order
+    "remote_mixed_plain": "v4, seed 0", "remote_mixed_token": "v4, seed 0",
+    "remote_mixed_perloop_between": "v4, seed 0",
     "remote_v3_s0": "v3, seed 0", "remote_v3_s1": "v3, seed 1", "remote_between": "Between block, seed 0",
     "remote_100m": "100M (older)", "remote_big": "v2 (older)", "remote_v3": "v3 first try (older)",
     "remote": "v1 (older)",
@@ -51,13 +56,32 @@ def discover(root: Path) -> list[dict]:
     return sorted(found, key=lambda e: (order.index(e["path"].split("/")[1]), e["name"]))
 
 
+def features(cfg: ModelConfig, ready: bool) -> dict[str, str]:
+    """What a model has, feature by feature, so the page can show which features two columns differ in."""
+    routing = ("none" if not cfg.use_experts else "per token" if cfg.route_per_token
+               else "per sequence, each run" if cfg.route_per_loop else "per sequence")
+    neuron = ("none" if not cfg.use_experts or not ready else
+              f"{cfg.neuron}, {cfg.neuron_train}" if cfg.run_mode == "joint" else "post-hoc")
+    between = "none"
+    if cfg.between_layers:
+        between = f"{cfg.between_layers} layers, {cfg.between_mode.replace('_', ' ')}"
+        between += ", learned merge" if cfg.between_merge else ""
+    return {"experts": f"{cfg.n_experts}, {cfg.active_experts} active" if cfg.use_experts else "none",
+            "routing": routing, "neuron": neuron,
+            "run signal": "yes" if getattr(cfg, "run_signal", False) else "no",
+            "boundary norm": "yes" if cfg.boundary_norm else "no",
+            "between block": between, "blocks": cfg.arch}
+
+
 def describe_cfg(cfg: ModelConfig, ready: bool) -> str:
     """A short plain description of what a model is."""
     if not cfg.use_experts:
         kind = "Plain: no experts, no neuron"
     else:
         kind = f"{cfg.n_experts} experts, {cfg.active_experts} active"
-        if cfg.route_per_loop:
+        if cfg.route_per_token:
+            kind += ", expert and runs chosen per token"
+        elif cfg.route_per_loop:
             kind += ", router picks again each run"
         if ready and cfg.run_mode == "joint":
             kind += f", run neuron ({cfg.neuron}, trained jointly, {cfg.neuron_train})"
@@ -69,6 +93,9 @@ def describe_cfg(cfg: ModelConfig, ready: bool) -> str:
         merge = (" with learned merge" + ("" if cfg.boundary_norm else ", no normalization")
                  if cfg.between_merge else "")
         kind += f"; between block {cfg.between_layers} layers, {cfg.between_mode.replace('_', ' ')}{merge}"
+    if getattr(cfg, "run_signal", False):
+        kind += "; run number signal"
+        kind += "" if cfg.boundary_norm else ", no boundary normalization"
     return kind
 
 
@@ -111,6 +138,8 @@ class Registry:
                  "experts": cfg.n_experts if cfg.use_experts else 0, "max_runs": cfg.max_runs,
                  "extra_runs": EXTRA_RUNS, "neuron": cfg.use_experts and ready,
                  "active_experts": cfg.active_experts, "per_loop": cfg.route_per_loop,
+                 "per_token": cfg.route_per_token, "run_signal": cfg.run_signal,
+                 "boundary_norm": cfg.boundary_norm, "features": features(cfg, ready),
                  "width": cfg.d_model, "params": params,
                  "layers": [cfg.n_input, cfg.n_core, cfg.n_output],
                  "between": {"layers": cfg.between_layers, "mode": cfg.between_mode,
@@ -243,7 +272,98 @@ def run_columns(registry: Registry, tok: Tokenizer, request: dict, emit) -> None
     emit({"finished": True})
 
 
-def make_handler(registry: Registry, tok: Tokenizer):
+def _pieces(tok: Tokenizer, ids: list[int]) -> list[str]:
+    """The text of each token as it appears in the whole decoded text, spaces included."""
+    pieces, before = [], ""
+    for end in range(1, len(ids) + 1):
+        now = tok.decode(ids[:end])
+        pieces.append(now[len(before):])
+        before = now
+    return pieces
+
+
+@torch.no_grad()
+def trace(model: Spidory, ids: list[int], choice: dict) -> dict:
+    """One forward pass over a text: per token, the loss of predicting it, its run count, the
+    runs it pays for, and its expert in each run."""
+    window = torch.tensor([ids[-model.cfg.seq_len:]])
+    length = window.size(1)
+    model._route_record = []
+    try:
+        if "cycle" in choice:
+            top = choice["cycle"]
+            ks = (torch.arange(length) % top + 1)[None]
+            logits = model.infer_tokens(window, ks, expert=choice.get("expert"))
+            runs = ks[0]
+            paid = torch.full_like(runs, top)  # every token passes every run, as attention needs them
+        else:
+            logits, _, ks = model.infer(window, **choice)
+            runs = ks[0] if ks.dim() == 2 else ks[0].repeat(length)
+            # A token runs as often as any later token, because their attention reads its state.
+            paid = runs.flip(-1).cummax(-1).values.flip(-1) if ks.dim() == 2 else runs
+        record = [r[0] for r in model._route_record]
+    finally:
+        model._route_record = None
+    losses = F.cross_entropy(logits[0, :-1].float(), window[0, 1:], reduction="none")
+    tokens = []
+    for t in range(length):
+        count = int(runs[t])
+        path = [int(r[t] if r.dim() else r) for r in record[:count]]
+        tokens.append({"loss": None if t == 0 else round(float(losses[t - 1]), 4), "runs": count,
+                       "paid": int(paid[t]), "path": path})
+    return {"tokens": tokens, "mean_loss": round(float(losses.mean()), 4) if length > 1 else None,
+            "mean_paid": round(float(paid.float().mean()), 3)}
+
+
+def trace_columns(registry: Registry, tok: Tokenizer, request: dict, emit) -> None:
+    """Every column's trace of the same text, one event per column."""
+    ids = tok.encode(request["text"]).ids
+    if len(ids) < 2:
+        emit({"error": "the text needs at least two tokens"})
+        return
+    seq_len = max((registry.get(c["model"]).cfg.seq_len for c in request["columns"]), default=256)
+    shown = ids[-seq_len:]
+    emit({"pieces": _pieces(tok, shown), "cut": len(ids) - len(shown)})
+    for index, column in enumerate(request["columns"]):
+        try:
+            model = registry.get(column["model"])
+            choice = {**setting_args(column["setting"], model), **expert_args(column.get("experts"), model)}
+            found = trace(model, shown, choice)
+            cost = tflops_by_k(model.cfg, EXTRA_RUNS)
+            found["mflops"] = round(sum(cost[t["paid"]] for t in found["tokens"]) / len(shown) * 1e6, 1)
+            emit({"col": index, **found})
+        except (ValueError, StopIteration, KeyError) as error:
+            emit({"col": index, "error": str(error)})
+    emit({"finished": True})
+
+
+def score_columns(registry: Registry, tok: Tokenizer, exams: Exams, request: dict, emit) -> None:
+    """Exam items in every column, one verdict per item and column, item by item."""
+    name = request["exam"]
+    exam = exams.get(name)
+    kind = EXAMS[name][0]
+    indices = [int(i) % len(exam) for i in request["indices"]][:200]
+    columns = []
+    for index, column in enumerate(request["columns"]):
+        try:
+            model = registry.get(column["model"])
+            choice = {**setting_args(column["setting"], model), **expert_args(column.get("experts"), model)}
+            if "cycle" in choice:
+                raise ValueError("exams run with one run setting per reply; pick a frozen count, average or neuron")
+            columns.append((index, model, choice))
+        except (ValueError, StopIteration, KeyError) as error:
+            emit({"col": index, "error": str(error)})
+    for item_index in indices:
+        item = exam[item_index]
+        for index, model, choice in columns:
+            began = time.perf_counter()
+            text, ok = answer_item(kind, model, tok, item, **choice)
+            emit({"col": index, "item": item_index, "text": text, "ok": bool(ok),
+                  "answer": str(item.get("answer", "")), "ms": round((time.perf_counter() - began) * 1000)})
+    emit({"finished": True})
+
+
+def make_handler(registry: Registry, tok: Tokenizer, exams: Exams | None = None):
     gpu_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -262,11 +382,27 @@ def make_handler(registry: Registry, tok: Tokenizer):
                 self._send(200, PAGE.read_bytes(), "text/html; charset=utf-8")
             elif self.path == "/api/models":
                 self._send(200, json.dumps(registry.describe()).encode(), "application/json")
+            elif self.path == "/api/exams" and exams is not None:
+                self._send(200, json.dumps(exams.describe()).encode(), "application/json")
+            elif self.path.startswith("/api/exam?") and exams is not None:
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    with gpu_lock:  # building an exam the first time takes a while
+                        exam = exams.get(query["name"][0])
+                    index = int(query.get("index", ["0"])[0]) % len(exam)
+                    body = {"index": index, "size": len(exam), "item": exam[index]}
+                    self._send(200, json.dumps(body).encode(), "application/json")
+                except (ValueError, KeyError) as error:
+                    self._send(400, json.dumps({"error": str(error)}).encode(), "application/json")
             else:
                 self._send(404, b"not found", "text/plain")
 
         def do_POST(self) -> None:
-            if self.path != "/api/run":
+            jobs = {"/api/run": lambda request, emit: run_columns(registry, tok, request, emit),
+                    "/api/trace": lambda request, emit: trace_columns(registry, tok, request, emit)}
+            if exams is not None:
+                jobs["/api/score"] = lambda request, emit: score_columns(registry, tok, exams, request, emit)
+            if self.path not in jobs:
                 self._send(404, b"not found", "text/plain")
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -280,7 +416,7 @@ def make_handler(registry: Registry, tok: Tokenizer):
 
             with gpu_lock:
                 try:
-                    run_columns(registry, tok, request, emit)
+                    jobs[self.path](request, emit)
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # the page pressed Stop
 
@@ -293,12 +429,16 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--tokenizer", default="data_v3/tokenizer.json", help="relative to --root")
     parser.add_argument("--root", default=".", help="project folder that holds runs/")
+    parser.add_argument("--data", default="data_v3", help="data folder for the maths exam and the "
+                        "held-out text the other exams are built from, relative to --root")
+    parser.add_argument("--templates", default=str(Path(__file__).resolve().parents[2] / "templates"))
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     root = Path(args.root)
     registry = Registry(root)
     tok = Tokenizer.from_file(str(root / args.tokenizer))
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(registry, tok))
+    exams = Exams(root / args.data, root / "runs" / "ui_exams", Path(args.templates))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(registry, tok, exams))
     print(f"Spidory playground on http://127.0.0.1:{args.port} with {len(registry.entries)} models", flush=True)
     server.serve_forever()
 

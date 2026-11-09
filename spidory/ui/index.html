@@ -83,23 +83,84 @@ input[type=number] { width: 72px; padding: 4px 6px; border: 1px solid var(--line
 .split { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (prefers-reduced-motion: no-preference) { .tok { transition: outline-color .15s; } }
+/* Modes, feature badges, exams and traces. */
+:root { --e0: #c9dcf5; --e1: #f6d3a8; --e2: #cdebc4; --e3: #e7cdf0; --good: #1f7a4d; --good-bg: #d6efe0; --bad-bg: #f6d6d2; }
+@media (prefers-color-scheme: dark) { :root { --e0: #24426b; --e1: #5c4120; --e2: #2b4d2a; --e3: #4a2e57; --good: #6fcf9c; --good-bg: #1d3d2c; --bad-bg: #4a2420; } }
+.modes { display: flex; gap: 6px; }
+.modes button { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 6px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+.modes button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.hidden { display: none !important; }
+.legend[hidden] { display: none; }
+.compare { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.compare .note { margin-right: 4px; }
+.compare button:disabled { opacity: .4; cursor: not-allowed; }
+.badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); border: 1px solid transparent; }
+.badge b { color: var(--ink); font-weight: 600; }
+.badge.diff { border-color: var(--accent); background: transparent; }
+.badge.diff b { color: var(--accent); }
+select.small { padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; max-width: 100%; }
+.items { display: grid; gap: 8px; }
+.item { border-left: 3px solid var(--line); padding: 2px 0 2px 10px; }
+.item.ok { border-color: var(--good); }
+.item.no { border-color: var(--bad); }
+.item .verdict { font: 600 12px var(--sans); }
+.item.ok .verdict { color: var(--good); }
+.item.no .verdict { color: var(--bad); }
+.item .reply { white-space: pre-wrap; font: 13px/1.5 var(--mono); }
+.tok.e0 { background: var(--e0); } .tok.e1 { background: var(--e1); } .tok.e2 { background: var(--e2); } .tok.e3 { background: var(--e3); }
+.score { padding: 14px 16px; display: grid; gap: 10px; }
+.score h2 { margin: 0; font-size: 14px; font-weight: 650; }
+.score .scroll { overflow-x: auto; }
+.score table { border-collapse: collapse; font: 13px var(--sans); font-variant-numeric: tabular-nums; }
+.score th, .score td { padding: 4px 10px; border-bottom: 1px solid var(--line); text-align: center; white-space: nowrap; }
+.score th:first-child, .score td:first-child { text-align: left; }
+.score td.ok { color: var(--good); background: var(--good-bg); }
+.score td.no { color: var(--bad); background: var(--bad-bg); }
+.score tr.total td { font-weight: 700; border-top: 1.5px solid var(--ink); }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Spidory playground</h1>
-    <p>One prompt, several models side by side. In each column, lock the expert and the run count, or let the router and the run neuron decide. Each token is coloured by how many runs of the loop it used.</p>
+    <p>Several models side by side. In each column, lock the expert and the run count, or let the router and the run neuron decide. The Compare buttons set up columns that differ in exactly one feature.</p>
   </header>
+  <nav class="modes" id="modes" aria-label="Mode">
+    <button data-mode="generate" class="on" title="Continue the prompt, token by token">Generate</button>
+    <button data-mode="exam" title="Held-out exam items, with a right or wrong verdict per column">Exam</button>
+    <button data-mode="trace" title="Score a text: loss, runs and expert of every token">Trace</button>
+  </nav>
 
   <section class="card deck" aria-label="Prompt">
     <textarea id="prompt" aria-label="Prompt">Q: a = 7, b = a + 5, c = b - 3. What is c?
 A:</textarea>
+    <div class="row compare" id="compare"><span class="note">Compare:</span></div>
+    <div class="row hidden" id="examPanel">
+      <label class="field">Exam <select id="examName" class="small"></select></label>
+      <label class="field">Item <input id="examIndex" type="number" min="0" value="0"></label>
+      <button class="ghost" id="examRandom">Random item</button>
+      <label class="field">Items to score <input id="examCount" type="number" min="1" max="200" value="20"></label>
+      <span class="note" id="examInfo"></span>
+    </div>
+    <div class="row hidden" id="tracePanel">
+      <span class="note">Colour tokens by</span>
+      <div class="seg" id="traceColour">
+        <button data-c="loss" class="on">Loss</button>
+        <button data-c="delta" title="Green: this column predicts the token better than column 1">Loss vs column 1</button>
+        <button data-c="expert">Expert</button>
+        <button data-c="runs">Runs</button>
+      </div>
+      <span class="note">Text longer than 256 tokens is cut to its last 256.</span>
+    </div>
     <div class="row chips" id="presets">
       <button data-p="Q: a = 7, b = a + 5, c = b - 3. What is c?&#10;A:">Variables</button>
       <button data-p="Q: What is 14 + 7 - 18 - 6 + 19 + 1 + 19 - 3 + 2?&#10;A:">Long chain</button>
       <button data-p="Q: Compute (3 + (4 * 2)) - (9 - 5).&#10;A:">Brackets</button>
       <button data-p="Once upon a time, there was a little fox who">Story</button>
+      <button data-p="Once upon a time, a little fox found 12 berries. Then she found 9 more and gave 4 to her friend.&#10;Q: How many berries does the fox have now?&#10;A:">Story with a problem</button>
+      <button data-p="Q: 3 * (4 + 5) = Explain step by step.&#10;A:">Explain in words</button>
+      <button data-p="Task: Make up a sum of 3 numbers that equals 20.&#10;Answer:">Compose</button>
       <button data-p="The Eiffel Tower is in Paris. It was built for the 1889 World's Fair.&#10;Q: When was the Eiffel Tower built?&#10;A:">Question</button>
     </div>
     <div class="row">
@@ -110,10 +171,19 @@ A:</textarea>
       <button class="ghost" id="addCol">Add column</button>
       <button class="ghost" id="sweep">Compare runs 1 to 4</button>
       <button class="ghost" id="sweepExperts">Compare each expert</button>
+      <label class="field" id="examModeNote"></label>
       <button class="primary" id="run">Run</button>
+      <button class="ghost hidden" id="scoreMany">Score items</button>
       <button class="ghost" id="stop" disabled>Stop</button>
     </div>
-    <div class="legend" aria-label="Run colours">
+    <div class="legend" aria-label="Expert colours" id="expertLegend" hidden>
+      <span><i style="background:var(--e0)"></i>expert 0</span>
+      <span><i style="background:var(--e1)"></i>expert 1</span>
+      <span><i style="background:var(--e2)"></i>expert 2</span>
+      <span><i style="background:var(--e3)"></i>expert 3</span>
+      <span>In the last run. Click a token for its expert in every run.</span>
+    </div>
+    <div class="legend" aria-label="Run colours" id="runLegend">
       <span><i style="background:var(--run1)"></i>1 run</span>
       <span><i style="background:var(--run2)"></i>2 runs</span>
       <span><i style="background:var(--run3)"></i>3 runs</span>
@@ -125,6 +195,10 @@ A:</textarea>
 
   <section class="columns" id="columns" aria-label="Model columns"></section>
 
+  <section class="card score hidden" id="scoreCard" aria-live="polite">
+    <h2>Exam scores, face to face</h2>
+    <div class="scroll" id="scoreTable"></div>
+  </section>
   <section class="card inspect" aria-live="polite">
     <h2>Token inspector</h2>
     <div id="inspector" class="empty">Run a prompt, then click any generated token.</div>
@@ -137,11 +211,40 @@ let models = [];
 let columns = [];
 let controller = null;
 let nextId = 1;
+let mode = "generate";
+let traceColour = "loss";
+let traceText = null;      // the pieces of the traced text, shared by every column
+let exams = [];
+let scored = [];           // exam item indices in the order they were scored
+const examItems = {};      // index -> item, for the current exam
+
+// Pairs that differ in one feature. Each entry: button label, help, then [model id, setting] per column.
+const PAIRS = [
+  ["Run signal", "Plain v4 without and with the run number signal",
+   [["remote_mixed_plain/plain_s0"], ["remote_mixed_plain/plain_signal_s0"]]],
+  ["Run signal, per token", "Per-token routing without and with the run number signal",
+   [["remote_mixed_token/token_s0"], ["remote_mixed_token/token_signal_s0"]]],
+  ["Normalization", "Run signal with and without normalization at the run boundary",
+   [["remote_mixed_plain/plain_signal_s0"], ["remote_mixed_plain/plain_signal_nonorm_s0"]]],
+  ["Routing", "Expert chosen per sequence each run, against per token",
+   [["remote_mixed_perloop_between/perloop_s0", "neuron"], ["remote_mixed_token/token_s0", "neuron"]]],
+  ["Experts", "No experts, against 4 experts chosen per token",
+   [["remote_mixed_plain/plain_s0"], ["remote_mixed_token/token_s0"]]],
+  ["Between block", "Run signal without and with a shared 6-layer block between runs",
+   [["remote_mixed_plain/plain_signal_s0"], ["remote_mixed_perloop_between/between_signal_s0"]]],
+  ["Neuron vs fixed", "The best v4 model: its run neuron, against 2 and 3 runs locked",
+   [["remote_mixed_token/token_signal_s0", "neuron"], ["remote_mixed_token/token_signal_s0", 2],
+    ["remote_mixed_token/token_signal_s0", 3]]],
+  ["v3 vs v4", "Plain trained on 3 datasets (v3) against 7 datasets (v4)",
+   [["remote_v3_s0/plain_s0"], ["remote_mixed_plain/plain_s0"]]],
+  ["v3 vs v4, per-loop", "Per-loop routing with its neuron, v3 against v4",
+   [["remote_v3_s0/neuron_net_sampled_perloop_s0", "neuron"], ["remote_mixed_perloop_between/perloop_s0", "neuron"]]],
+];
 
 const modelById = (id) => models.find((m) => m.id === id);
 
 function addColumn(model, setting, experts = { kind: "router" }) {
-  columns.push({ id: nextId++, model, setting, experts, tokens: [], error: null, done: false });
+  columns.push({ id: nextId++, model, setting, experts, tokens: [], error: null, done: false, exam: {}, trace: null });
   render();
 }
 
@@ -156,16 +259,65 @@ function settingLabel(s, e) {
 const runClass = (t, m) => (m && t.runs > m.max_runs ? "rx" : `r${t.runs}`);
 
 function stats(col) {
+  if (mode === "exam") {
+    const done = Object.values(col.exam);
+    if (!done.length) return [["Items", "0"], ["Right", "—"], ["Accuracy", "—"], ["s/item", "—"]];
+    const right = done.filter((x) => x.ok).length;
+    const sec = done.reduce((a, x) => a + x.ms, 0) / done.length / 1000;
+    return [["Items", String(done.length)], ["Right", String(right)],
+            ["Accuracy", `${(100 * right / done.length).toFixed(1)}%`], ["s/item", sec.toFixed(1)]];
+  }
+  if (mode === "trace") {
+    const tr = col.trace;
+    return [["Tokens", tr ? String(tr.tokens.length) : "0"], ["Mean loss", tr && tr.mean_loss != null ? tr.mean_loss.toFixed(3) : "—"],
+            ["Runs paid", tr ? tr.mean_paid.toFixed(2) : "—"], ["MFLOPs/token", tr ? tr.mflops.toFixed(0) : "—"]];
+  }
   const t = col.tokens;
-  if (!t.length) return { n: "0", runs: "—", mflops: "—", ms: "—" };
+  if (!t.length) return [["Tokens", "0"], ["Avg runs", "—"], ["MFLOPs/token", "—"], ["ms/token", "—"]];
   const avg = (f) => t.reduce((a, x) => a + f(x), 0) / t.length;
-  return { n: String(t.length), runs: avg((x) => x.runs).toFixed(2),
-           mflops: avg((x) => x.mflops).toFixed(0), ms: avg((x) => x.ms).toFixed(0) };
+  return [["Tokens", String(t.length)], ["Avg runs", avg((x) => x.runs).toFixed(2)],
+          ["MFLOPs/token", avg((x) => x.mflops).toFixed(0)], ["ms/token", avg((x) => x.ms).toFixed(0)]];
+}
+
+function badges(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "badges";
+  const first = columns.length ? modelById(columns[0].model) : null;
+  Object.entries(m.features || {}).forEach(([k, v]) => {
+    const b = document.createElement("span");
+    b.className = "badge";
+    if (first && first !== m && first.features && first.features[k] !== v) b.classList.add("diff");
+    b.append(`${k}: `);
+    const strong = document.createElement("b"); strong.textContent = v; b.append(strong);
+    wrap.append(b);
+  });
+  return wrap;
+}
+
+function traceClass(col, i) {
+  const t = col.trace.tokens[i];
+  if (traceColour === "expert") return t.path.length ? `e${t.path[t.path.length - 1] % 4}` : "";
+  if (traceColour === "runs") return t.runs > 4 ? "rx" : `r${t.runs}`;
+  return "";
+}
+function traceStyle(col, i) {
+  const t = col.trace.tokens[i];
+  if (t.loss == null) return "";
+  if (traceColour === "loss") return `background: rgba(179, 38, 30, ${Math.min(0.75, t.loss / 8).toFixed(3)})`;
+  if (traceColour === "delta") {
+    const base = columns[0] && columns[0].trace ? columns[0].trace.tokens[i] : null;
+    if (!base || base.loss == null || columns[0] === col) return "";
+    const d = t.loss - base.loss;
+    const a = Math.min(0.75, Math.abs(d) / 2).toFixed(3);
+    return d < 0 ? `background: rgba(31, 122, 77, ${a})` : `background: rgba(179, 38, 30, ${a})`;
+  }
+  return "";
 }
 
 function render() {
   const holder = $("#columns");
   holder.replaceChildren(...columns.map(renderColumn));
+  renderScoreTable();
 }
 
 function renderColumn(col) {
@@ -240,6 +392,7 @@ function renderColumn(col) {
   if (m && !m.experts) { const n = document.createElement("span"); n.className = "note"; n.textContent = "this model has no experts"; eseg.append(n); }
 
   head.append(top, seg, eseg);
+  if (m) head.append(badges(m));
   if (col.setting.kind === "mean") {
     const row = document.createElement("label");
     row.className = "mean";
@@ -259,7 +412,7 @@ function renderColumn(col) {
   const s = stats(col);
   const statsEl = document.createElement("div");
   statsEl.className = "stats";
-  [["Tokens", s.n], ["Avg runs", s.runs], ["MFLOPs/token", s.mflops], ["ms/token", s.ms]].forEach(([k, v]) => {
+  s.forEach(([k, v]) => {
     const d = document.createElement("div");
     const b = document.createElement("b"); b.textContent = v;
     const sp = document.createElement("span"); sp.textContent = k;
@@ -268,6 +421,25 @@ function renderColumn(col) {
 
   const out = document.createElement("div");
   out.className = "out";
+  if (mode === "exam") {
+    out.append(renderExam(col));
+  } else if (mode === "trace") {
+    if (!col.trace) { const n = document.createElement("span"); n.className = "note"; n.textContent = "Press Run to score the text above."; out.append(n); }
+    else traceText.forEach((piece, i) => {
+      const span = document.createElement("span");
+      span.className = `tok ${traceClass(col, i)}`;
+      const style = traceStyle(col, i); if (style) span.style.cssText = style;
+      span.textContent = piece;
+      span.tabIndex = 0;
+      const t = col.trace.tokens[i];
+      span.title = `${t.loss == null ? "first token" : "loss " + t.loss.toFixed(2)}, ${t.runs} run${t.runs > 1 ? "s" : ""}` +
+        (t.path.length ? `, expert ${t.path.join(" → ")}` : "");
+      const show = () => { document.querySelectorAll(".tok.sel").forEach((x) => x.classList.remove("sel")); span.classList.add("sel"); inspectTrace(i); };
+      span.onclick = show;
+      span.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); show(); } };
+      out.append(span);
+    });
+  } else {
   const p = document.createElement("span"); p.className = "prompt-text"; p.textContent = $("#prompt").value;
   out.append(p);
   col.tokens.forEach((t, i) => {
@@ -281,10 +453,85 @@ function renderColumn(col) {
     span.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); show(); } };
     out.append(span);
   });
+  }
   if (col.error) { const e = document.createElement("div"); e.className = "err"; e.textContent = col.error; out.append(e); }
 
   card.append(head, statsEl, out);
   return card;
+}
+
+function renderExam(col) {
+  const list = document.createElement("div");
+  list.className = "items";
+  if (!scored.length) { const n = document.createElement("span"); n.className = "note"; n.textContent = "Run scores the item shown above; Score items runs several."; list.append(n); }
+  scored.slice().reverse().forEach((index) => {
+    const res = col.exam[index];
+    const box = document.createElement("div");
+    box.className = `item ${res ? (res.ok ? "ok" : "no") : ""}`;
+    const v = document.createElement("div"); v.className = "verdict";
+    v.textContent = res ? `${res.ok ? "✓ right" : "✗ wrong"} · item ${index} · expected ${res.answer}` : `item ${index} · waiting`;
+    box.append(v);
+    if (res) { const t = document.createElement("div"); t.className = "reply"; t.textContent = res.text.trim() || "(empty reply)"; box.append(t); }
+    list.append(box);
+  });
+  return list;
+}
+
+function renderScoreTable() {
+  const card = $("#scoreCard");
+  card.classList.toggle("hidden", mode !== "exam" || !scored.length);
+  if (mode !== "exam" || !scored.length) return;
+  const table = document.createElement("table");
+  const head = table.createTHead().insertRow();
+  const h0 = document.createElement("th"); h0.textContent = "Item"; head.append(h0);
+  columns.forEach((c, i) => {
+    const th = document.createElement("th");
+    const m = modelById(c.model);
+    th.textContent = `${i + 1}. ${m ? m.name : c.model}`;
+    th.title = settingLabel(c.setting, c.experts);
+    head.append(th);
+  });
+  const body = table.createTBody();
+  const total = body.insertRow(); total.className = "total";
+  total.insertCell().textContent = `Accuracy (${scored.length})`;
+  columns.forEach((c) => {
+    const done = scored.filter((i) => c.exam[i]);
+    const right = done.filter((i) => c.exam[i].ok).length;
+    total.insertCell().textContent = done.length ? `${(100 * right / done.length).toFixed(1)}% (${right}/${done.length})` : "—";
+  });
+  scored.forEach((index) => {
+    const row = body.insertRow();
+    row.insertCell().textContent = String(index);
+    columns.forEach((c) => {
+      const cell = row.insertCell();
+      const res = c.exam[index];
+      if (res) { cell.className = res.ok ? "ok" : "no"; cell.textContent = res.ok ? "✓" : "✗"; cell.title = res.text.trim(); }
+      else cell.textContent = "…";
+    });
+  });
+  $("#scoreTable").replaceChildren(table);
+}
+
+function inspectTrace(i) {
+  const box = $("#inspector");
+  box.className = "";
+  const head = document.createElement("p");
+  head.style.margin = "0";
+  head.textContent = `Token ${i + 1}: ${JSON.stringify(traceText[i])}, in every column:`;
+  const table = document.createElement("table");
+  table.style.borderCollapse = "collapse";
+  const hr = table.createTHead().insertRow();
+  ["Column", "Loss", "Runs", "Runs paid", "Expert in each run"].forEach((x) => { const th = document.createElement("th"); th.textContent = x; th.style.textAlign = "left"; th.style.padding = "2px 12px 2px 0"; hr.append(th); });
+  const body = table.createTBody();
+  columns.forEach((c, n) => {
+    if (!c.trace) return;
+    const t = c.trace.tokens[i];
+    const row = body.insertRow();
+    const m = modelById(c.model);
+    [`${n + 1}. ${m ? m.name : c.model}`, t.loss == null ? "—" : t.loss.toFixed(3), String(t.runs), String(t.paid),
+     t.path.length ? t.path.join(" → ") : "no experts"].forEach((x) => { const td = row.insertCell(); td.textContent = x; td.style.padding = "2px 12px 2px 0"; td.style.fontFamily = "var(--mono)"; });
+  });
+  box.replaceChildren(head, table);
 }
 
 function bars(title, rows) {
@@ -320,19 +567,58 @@ function inspect(col, t, i) {
   box.replaceChildren(head, split);
 }
 
+const columnSpecs = () => columns.map((c) => ({ model: c.model, setting: c.setting, experts: c.experts }));
+
 async function run() {
   if (!columns.length) return;
+  if (mode === "exam") return score([Number($("#examIndex").value)]);
+  if (mode === "trace") return runTrace();
   columns.forEach((c) => { c.tokens = []; c.error = null; c.done = false; });
   render();
-  controller = new AbortController();
-  $("#run").disabled = true; $("#stop").disabled = false;
   const body = { prompt: $("#prompt").value, max_tokens: Number($("#maxTokens").value),
                  temperature: Number($("#temperature").value), seed: Number($("#seed").value),
-                 columns: columns.map((c) => ({ model: c.model, setting: c.setting, experts: c.experts })) };
+                 columns: columnSpecs() };
+  await stream("/api/run", body, (ev) => {
+    const col = columns[ev.col];
+    if (ev.error && col) col.error = ev.error;
+    else if (ev.end && col) col.done = true;
+    else if (col && ev.text !== undefined) col.tokens.push(ev);
+  });
+}
+
+async function runTrace() {
+  columns.forEach((c) => { c.trace = null; c.error = null; });
+  traceText = null;
+  render();
+  await stream("/api/trace", { text: $("#prompt").value, columns: columnSpecs() }, (ev) => {
+    if (ev.pieces) traceText = ev.pieces;
+    else if (ev.error && ev.col === undefined) columns.forEach((c) => (c.error = ev.error));
+    else if (ev.error) columns[ev.col].error = ev.error;
+    else if (ev.tokens) columns[ev.col].trace = ev;
+  });
+}
+
+async function score(indices) {
+  const name = $("#examName").value;
+  const fresh = indices.filter((i) => !scored.includes(i));
+  columns.forEach((c) => { c.error = null; indices.forEach((i) => delete c.exam[i]); });
+  scored = scored.filter((i) => !indices.includes(i)).concat(indices);
+  render();
+  await stream("/api/score", { exam: name, indices, columns: columnSpecs() }, (ev) => {
+    const col = columns[ev.col];
+    if (ev.error && col) col.error = ev.error;
+    else if (col && ev.item !== undefined) col.exam[ev.item] = ev;
+  });
+  return fresh;
+}
+
+async function stream(url, body, onEvent) {
+  controller = new AbortController();
+  $("#run").disabled = true; $("#scoreMany").disabled = true; $("#stop").disabled = false;
   let pending = false;
   const schedule = () => { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); } };
   try {
-    const res = await fetch("/api/run", { method: "POST", body: JSON.stringify(body), signal: controller.signal });
+    const res = await fetch(url, { method: "POST", body: JSON.stringify(body), signal: controller.signal });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -344,18 +630,14 @@ async function run() {
       while ((cut = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, cut); buffer = buffer.slice(cut + 1);
         if (!line) continue;
-        const ev = JSON.parse(line);
-        const col = columns[ev.col];
-        if (ev.error && col) col.error = ev.error;
-        else if (ev.end && col) col.done = true;
-        else if (col && ev.text !== undefined) col.tokens.push(ev);
+        onEvent(JSON.parse(line));
         schedule();
       }
     }
   } catch (e) {
     if (e.name !== "AbortError") columns.forEach((c) => (c.error = c.error || "The server stopped answering."));
   }
-  $("#run").disabled = false; $("#stop").disabled = true;
+  $("#run").disabled = false; $("#scoreMany").disabled = false; $("#stop").disabled = true;
   render();
 }
 
@@ -377,9 +659,101 @@ $("#sweepExperts").onclick = () => {
   for (let e = 0; e < m.experts; e++) addColumn(m.id, last ? { ...last.setting } : { kind: "frozen", value: 2 }, { kind: "fixed", value: e });
 };
 
+function setMode(next) {
+  mode = next;
+  document.querySelectorAll("#modes button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  $("#examPanel").classList.toggle("hidden", mode !== "exam");
+  $("#tracePanel").classList.toggle("hidden", mode !== "trace");
+  $("#scoreMany").classList.toggle("hidden", mode !== "exam");
+  $("#presets").classList.toggle("hidden", mode === "exam");
+  $("#maxTokens").parentElement.classList.toggle("hidden", mode !== "generate");
+  $("#temperature").parentElement.classList.toggle("hidden", mode !== "generate");
+  $("#seed").parentElement.classList.toggle("hidden", mode !== "generate");
+  $("#expertLegend").hidden = !(mode === "trace" && traceColour === "expert");
+  $("#runLegend").hidden = mode === "exam" || (mode === "trace" && traceColour !== "runs");
+  $("#prompt").readOnly = mode === "exam";
+  $("#run").textContent = mode === "exam" ? "Score this item" : mode === "trace" ? "Trace" : "Run";
+  if (mode === "exam") loadItem();
+  const box = $("#inspector");
+  box.className = "empty";
+  box.textContent = mode === "trace" ? "Trace a text, then click any token to compare it across columns."
+    : mode === "exam" ? "Each column lists its replies, newest first, with the expected answer."
+    : "Run a prompt, then click any generated token.";
+  render();
+}
+$("#modes").onclick = (e) => { const b = e.target.closest("button"); if (b) setMode(b.dataset.mode); };
+$("#traceColour").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  traceColour = b.dataset.c;
+  document.querySelectorAll("#traceColour button").forEach((x) => x.classList.toggle("on", x === b));
+  setMode("trace");
+};
+
+async function loadItem() {
+  const name = $("#examName").value;
+  if (!name) return;
+  $("#examInfo").textContent = "Loading (the first time an exam is built, this takes up to a minute)…";
+  try {
+    const res = await (await fetch(`/api/exam?name=${encodeURIComponent(name)}&index=${Number($("#examIndex").value)}`)).json();
+    if (res.error) { $("#examInfo").textContent = res.error; return; }
+    examItems[res.index] = res.item;
+    $("#examIndex").max = String(res.size - 1);
+    $("#prompt").value = res.item.prompt;
+    const extra = res.item.level ? `, level ${res.item.level}` : res.item.kind ? `, ${res.item.kind}` : "";
+    $("#examInfo").textContent = `${res.size} items. Expected answer: ${res.item.answer}${extra}.`;
+  } catch (e) { $("#examInfo").textContent = "Could not load the exam."; }
+}
+$("#examName").onchange = () => { scored = []; columns.forEach((c) => (c.exam = {})); loadItem(); render(); };
+$("#examIndex").onchange = loadItem;
+$("#examRandom").onclick = () => {
+  const size = Number($("#examIndex").max || 0) + 1;
+  $("#examIndex").value = String(Math.floor(Math.random() * Math.max(1, size)));
+  loadItem();
+};
+$("#scoreMany").onclick = () => {
+  const start = Number($("#examIndex").value), n = Math.max(1, Math.min(200, Number($("#examCount").value)));
+  const size = Number($("#examIndex").max || 0) + 1;
+  score(Array.from({ length: n }, (_, i) => (start + i) % size));
+};
+
+function buildCompare() {
+  const bar = $("#compare");
+  PAIRS.forEach(([label, help, cols]) => {
+    const b = document.createElement("button");
+    b.className = "ghost";
+    b.textContent = label;
+    const missing = cols.filter(([id]) => !modelById(id)).map(([id]) => id);
+    b.disabled = missing.length > 0;
+    b.title = missing.length ? `Missing on disk: ${missing.join(", ")}` : help;
+    b.onclick = () => {
+      // The run setting of the first column, or 3 runs, goes to every column that doesn't set its own.
+      const base = columns[0] && columns[0].setting.kind !== "neuron" ? { ...columns[0].setting } : { kind: "frozen", value: 3 };
+      columns = [];
+      cols.forEach(([id, setting]) => {
+        const m = modelById(id);
+        let s = setting === "neuron" ? { kind: "neuron" } : typeof setting === "number" ? { kind: "frozen", value: setting } : { ...base };
+        if (s.kind === "neuron" && !m.neuron) s = { kind: "frozen", value: 3 };
+        if (s.kind === "mean" && !m.experts) s = { kind: "frozen", value: 3 };
+        addColumn(id, s);
+      });
+      scored = [];
+    };
+    bar.append(b);
+  });
+}
+
 (async () => {
+  exams = await (await fetch("/api/exams")).json().catch(() => []);
+  exams.forEach((x) => $("#examName").append(new Option(x.label, x.name)));
   models = await (await fetch("/api/models")).json();
   if (!models.length) { $("#columns").textContent = "No trained models were found in runs/."; return; }
+  buildCompare();
+  if (modelById("remote_mixed_plain/plain_s0") && modelById("remote_mixed_plain/plain_signal_s0")) {
+    addColumn("remote_mixed_plain/plain_s0", { kind: "frozen", value: 3 });
+    addColumn("remote_mixed_plain/plain_signal_s0", { kind: "frozen", value: 3 });
+    addColumn("remote_mixed_token/token_signal_s0", { kind: "neuron" });
+    return;
+  }
   const neuron = models.find((m) => m.id.endsWith("neuron_between_per_gap_s0")) || models.find((m) => m.neuron);
   const plain = models.find((m) => !m.experts && m.group === neuron?.group) || models.find((m) => !m.experts);
   if (neuron) { addColumn(neuron.id, { kind: "neuron" }); addColumn(neuron.id, { kind: "frozen", value: 1 }); addColumn(neuron.id, { kind: "frozen", value: 2 }); }

@@ -151,3 +151,122 @@ def test_per_token_cycle_gives_each_token_its_own_runs(registry):
         runs = [e["runs"] for e in tokens if e["col"] == col]
         assert runs == [(prompt - 1 + i) % top + 1 for i in range(len(runs))]
     assert all(e["expert"] == 1 and e["path"] == [1] * e["runs"] for e in tokens if e["col"] == 1)
+
+
+# ----- playground v4: new model flags, traces and exams -----
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import torch.nn.functional as F  # noqa: E402
+
+from spidory.ui import exams as ui_exams  # noqa: E402
+
+from test_mixed_data import _streams, tok  # noqa: E402,F401
+
+TOKEN_CFG = replace(CFG, route_per_token=True, route_per_loop=True, run_signal=True)
+
+
+@pytest.fixture
+def v4_registry(tmp_path, corpus):  # noqa: F811
+    entries = []
+    for name, cfg in (("token", TOKEN_CFG), ("moe", CFG), ("plain", replace(CFG, use_experts=False))):
+        model = Spidory(cfg)
+        if cfg.use_experts:
+            wake_experts(model)
+            model.run_head_ready.fill_(True)
+        save(tmp_path / name / "last.pt", model, make_optimizer(model, TCFG), 1, TCFG, corpus)
+        entries.append({"id": name, "name": name, "note": "", "path": f"{name}/last.pt"})
+    return server.Registry(tmp_path, entries)
+
+
+def test_v4_models_are_found_first_with_their_features(tmp_path, corpus):  # noqa: F811
+    runs = {"remote_v3_s0/plain_s0": CFG,
+            "remote_mixed_token/token_signal_s0": TOKEN_CFG,
+            "remote_mixed_plain/plain_signal_nonorm_s0": replace(CFG, use_experts=False, run_signal=True,
+                                                                 boundary_norm=False)}
+    for where, cfg in runs.items():
+        model = Spidory(cfg)
+        save(tmp_path / "runs" / where / "last.pt", model, make_optimizer(model, TCFG), 1, TCFG, corpus)
+    found = {m["id"]: m for m in server.Registry(tmp_path).describe()}
+    assert list(found)[-1] == "remote_v3_s0/plain_s0"  # v4 comes first
+    token, nonorm = found["remote_mixed_token/token_signal_s0"], found["remote_mixed_plain/plain_signal_nonorm_s0"]
+    assert token["group"] == nonorm["group"] == "v4, seed 0"
+    assert token["per_token"] and token["run_signal"] and token["features"]["routing"] == "per token"
+    assert "chosen per token" in token["note"] and "run number signal" in token["note"]
+    assert nonorm["features"]["boundary norm"] == "no" and "no boundary normalization" in nonorm["note"]
+    assert found["remote_v3_s0/plain_s0"]["features"]["run signal"] == "no"
+
+
+def test_trace_gives_loss_runs_and_experts_per_token(v4_registry):
+    events = []
+    columns = [{"model": "token", "setting": {"kind": "frozen", "value": 2}},
+               {"model": "token", "setting": {"kind": "neuron"}},
+               {"model": "moe", "setting": {"kind": "frozen", "value": 3}},
+               {"model": "plain", "setting": {"kind": "cycle", "value": 3}},
+               {"model": "plain", "setting": {"kind": "neuron"}}]
+    server.trace_columns(v4_registry, FakeTok(), {"text": "hello there friend", "columns": columns}, events.append)
+    pieces = events[0]["pieces"]
+    traces = {e["col"]: e for e in events if "tokens" in e}
+    assert len(pieces) == len(FakeTok().encode("hello there friend").ids)
+    assert any(e.get("error") for e in events if e.get("col") == 4) and events[-1] == {"finished": True}
+    ids = torch.tensor([FakeTok().encode("hello there friend").ids])
+    logits = v4_registry.get("token").infer(ids, k=2)[0]
+    expected = F.cross_entropy(logits[0, :-1].float(), ids[0, 1:], reduction="none")
+    got = torch.tensor([t["loss"] for t in traces[0]["tokens"][1:]])
+    assert traces[0]["tokens"][0]["loss"] is None and torch.allclose(got, expected, atol=1e-3)
+    for t in traces[0]["tokens"]:
+        assert t["runs"] == t["paid"] == 2 and len(t["path"]) == 2
+    runs = [t["runs"] for t in traces[1]["tokens"]]  # the neuron chooses per token
+    assert [t["paid"] for t in traces[1]["tokens"]] == [max(runs[i:]) for i in range(len(runs))]
+    assert all(len(t["path"]) == t["runs"] for t in traces[1]["tokens"])
+    assert all(t["runs"] == t["paid"] == 3 and len(set(t["path"])) <= 1 for t in traces[2]["tokens"])
+    cycle = traces[3]["tokens"]
+    assert [t["runs"] for t in cycle] == [i % 3 + 1 for i in range(len(cycle))]
+    assert all(t["paid"] == 3 and t["path"] == [] for t in cycle)
+    assert all(traces[c]["mflops"] > 0 for c in traces)
+
+
+class FakeExams:
+    def get(self, name):
+        return [{"prompt": f"Q: {i}?\nA:", "answer": str(i), "level": 2} for i in range(5)]
+
+
+def test_score_streams_one_verdict_per_item_and_column(v4_registry, monkeypatch):
+    monkeypatch.setitem(server.EXAMS, "toy", ("maths", "toy", "toy.json"))
+    events = []
+    columns = [{"model": "moe", "setting": {"kind": "frozen", "value": 2}},
+               {"model": "token", "setting": {"kind": "neuron"}},
+               {"model": "plain", "setting": {"kind": "cycle", "value": 2}}]
+    server.score_columns(v4_registry, FakeTok(), FakeExams(), {"exam": "toy", "indices": [3, 7], "columns": columns},
+                         events.append)
+    verdicts = [e for e in events if "item" in e]
+    assert [(e["item"], e["col"]) for e in verdicts] == [(3, 0), (3, 1), (2, 0), (2, 1)]  # 7 wraps to 2
+    assert all(isinstance(e["ok"], bool) and e["answer"] == str(e["item"]) for e in verdicts)
+    assert any(e.get("error") for e in events if e.get("col") == 2) and events[-1] == {"finished": True}
+
+
+def test_exam_answers_match_the_evaluation_scores(v4_registry):
+    from spidory import evaluate
+
+    model, exam = v4_registry.get("moe"), FakeExams().get("toy")
+    ok = [evaluate.answer_item("maths", model, FakeTok(), item, k=2)[1] for item in exam]
+    assert evaluate.maths_accuracy(model, FakeTok(), exam, len(exam), k=2) == sum(ok) / len(exam)
+
+
+def test_exams_are_built_into_the_cache_only(tmp_path, tok):  # noqa: F811
+    data, cache = tmp_path / "data", tmp_path / "cache"
+    data.mkdir()
+    _streams(data, tok)
+    tok.save(str(data / "tokenizer.json"))
+    before = {p.name: p.stat().st_mtime_ns for p in data.iterdir()}
+    templates = Path(__file__).resolve().parents[1] / "templates"
+    ui_exams.build(data, cache, templates, held_tokens=3_000, names=("explain", "mixed", "compose"))
+    assert {p.name: p.stat().st_mtime_ns for p in data.iterdir()} == before
+    for name in ("explain", "mixed", "compose"):
+        rows = json.loads((cache / ui_exams.EXAMS[name][2]).read_text())
+        assert rows and all("prompt" in r and "answer" in r for r in rows)
+    found = ui_exams.Exams(data, cache, templates)
+    assert len(found.get("compose")) == 300 and found.describe()[2]["size"] == len(found.get("explain"))
+    with pytest.raises(ValueError):
+        found.get("nothing")

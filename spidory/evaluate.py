@@ -88,22 +88,7 @@ def decisions(model, corpus: Corpus, windows: int, mean_runs: float | None = Non
 @torch.no_grad()
 def maths_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """Exact-answer rate with greedy generation on the real inference path."""
-    device = next(model.parameters()).device
-    eod, correct = tok.token_to_id("[EOD]"), 0
-    for item in exam[:questions]:
-        prompt = tok.encode(item["prompt"]).ids
-        ids, text = list(prompt), ""
-        for _ in range(16):
-            window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
-            next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
-            if next_id == eod:
-                break
-            ids.append(next_id)
-            text = tok.decode(ids[len(prompt):])
-            if "\n" in text:
-                break
-        correct += text.split("\n")[0].strip() == item["answer"]
-    return correct / questions
+    return sum(answer_item("maths", model, tok, item, **choice)[1] for item in exam[:questions]) / questions
 
 
 def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> dict:
@@ -139,11 +124,8 @@ def generate_text(model, tok: Tokenizer, prompt: str, longest: int, done=None, *
 
 def compose_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """Share of "write a problem" tasks done as asked, checked by computing the reply."""
-    from .mixed_data import grade_compose
-
     items = exam[:questions]
-    return sum(grade_compose(i, generate_text(model, tok, i["prompt"], 180, compose_done(i), **choice))
-               for i in items) / max(1, len(items))
+    return sum(answer_item("compose", model, tok, i, **choice)[1] for i in items) / max(1, len(items))
 
 
 def compose_done(item: dict):
@@ -159,47 +141,67 @@ def compose_done(item: dict):
 
 def word_problem_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """GSM8K or SVAMP: the stated answer, or the last number written, must match."""
-    from .mixed_data import last_number
-
-    def done(text):
-        return "answer is" in text.lower() and text.rstrip().endswith(".") or "\nQ:" in text
-
     items = exam[:questions]
-    hits = 0
-    for item in items:
-        text = generate_text(model, tok, item["prompt"], 300, done, **choice).split("\nQ:")[0]
-        found = last_number(text)
-        try:
-            hits += found is not None and float(found) == float(item["answer"])
-        except ValueError:
-            pass
-    return hits / max(1, len(items))
+    return sum(answer_item("word", model, tok, i, **choice)[1] for i in items) / max(1, len(items))
 
 
-@torch.no_grad()
 def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 220,
                      **choice) -> float:
     """Exact-answer rate when the model explains its steps first and ends with "The answer is N"."""
-    from .mixed_data import answer_of
+    hits = sum(answer_item("explain", model, tok, item, longest=longest, **choice)[1]
+               for item in exam[:questions])
+    return hits / max(1, min(questions, len(exam)))
 
+
+def _word_done(text: str) -> bool:
+    return "answer is" in text.lower() and text.rstrip().endswith(".") or "\nQ:" in text
+
+
+@torch.no_grad()
+def answer_item(kind: str, model, tok: Tokenizer, item: dict, longest: int | None = None,
+                **choice) -> tuple[str, bool]:
+    """One exam item: the model's greedy reply and whether it is right.
+
+    kind is "maths" (the first line must equal the answer, also used for the mixed-topic exam),
+    "explain" (the sentence ending "the answer is N"), "compose" (the reply must do what was
+    asked, checked by computing) or "word" (GSM8K: the stated or last number must match). The
+    accuracy functions above and the playground both score through here.
+    """
+    from .mixed_data import answer_of, grade_compose, last_number
+
+    if kind == "compose":
+        text = generate_text(model, tok, item["prompt"], longest or 180, compose_done(item), **choice)
+        return text, grade_compose(item, text)
+    if kind == "word":
+        text = generate_text(model, tok, item["prompt"], longest or 300, _word_done, **choice).split("\nQ:")[0]
+        found = last_number(text)
+        try:
+            return text, found is not None and float(found) == float(item["answer"])
+        except ValueError:
+            return text, False
     device = next(model.parameters()).device
-    eod, correct = tok.token_to_id("[EOD]"), 0
-    for item in exam[:questions]:
-        prompt = tok.encode(item["prompt"]).ids
-        ids, found = list(prompt), None
-        for _ in range(longest):
-            window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
-            next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
-            if next_id == eod:
+    eod = tok.token_to_id("[EOD]")
+    prompt = tok.encode(item["prompt"]).ids
+    ids, text, found = list(prompt), "", None
+    for _ in range(longest or (16 if kind == "maths" else 220)):
+        window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
+        next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
+        if next_id == eod:
+            break
+        ids.append(next_id)
+        text = tok.decode(ids[len(prompt):])
+        if kind == "maths":
+            if "\n" in text:
                 break
-            ids.append(next_id)
-            text = tok.decode(ids[len(prompt):])
-            if "\n" in text or text.rstrip().endswith("."):
-                found = answer_of(text)
-                if found is not None or "\n" in text:
-                    break
-        correct += found == item["answer"]
-    return correct / max(1, min(questions, len(exam)))
+        elif "\n" in text or text.rstrip().endswith("."):
+            found = answer_of(text)
+            if found is not None or "\n" in text:
+                break
+    if kind == "maths":
+        return text, text.split("\n")[0].strip() == item["answer"]
+    if kind == "explain":
+        return text, found == item["answer"]
+    raise ValueError(f"unknown exam kind {kind!r}")
 
 
 @torch.no_grad()

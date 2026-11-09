@@ -448,4 +448,15 @@ Still open, from the review:
   - a backup of every run is on Hugging Face (`Davidow/spidory-runs`, private)
 - **Branch `run-signal-per-token`:** v4 code, data v6 and `scripts/run_mixed.sh`.
 - **Report:** https://claude.ai/artifact/DrpnN2ih7TmFuriKtiUvUi
+- **Playground (branch `playground-v4`):** `python -m spidory.ui.server --root <project>` from the
+  branch folder, then http://127.0.0.1:8765. It runs on the laptop CPU and has three modes:
+  - **Generate:** models side by side, with the run count and the expert locked per column.
+  - **Exam:** held-out items with a right or wrong verdict per column. The maths, mixed, explained,
+    compose and GSM8K exams are rebuilt locally into `runs/ui_exams/`; their test splits match
+    the remote losses exactly. Accuracies can differ by a few items from the GPU results,
+    because greedy answers flip under CPU rounding.
+  - **Trace:** loss, runs, paid runs and the expert in every run, for every token.
+
+  "Compare" buttons set up columns that differ in one feature, such as the run signal,
+  normalization, routing, experts, the between block, neuron vs fixed runs, or v3 vs v4.
 - **Older dashboard:** https://claude.ai/artifact/YFv3h5vffvVQHrpUU8pJ7v (100M results)
