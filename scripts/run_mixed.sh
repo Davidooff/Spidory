@@ -26,6 +26,8 @@ VERSIONS=(
   "token_signal:--route-per-token --route-per-loop --run-signal:$NEURON"
   "token_signal_once:--route-per-token --run-signal:$NEURON"  # experts chosen per token once, kept in every run
   "between_signal:--between-layers 6 --between-mode shared --run-signal:$NEURON"
+  "noloop:--plain --max-runs 1:--control-only"  # no loop: the 10-layer centre runs once
+  "noloop_deep:--plain --max-runs 1 --n-core 30:--control-only"  # no loop, compute of Plain at k = 3
 )
 WANTED=",${2:-all},"
 for ENTRY in "${VERSIONS[@]}"; do
@@ -33,7 +35,7 @@ for ENTRY in "${VERSIONS[@]}"; do
   [ "$WANTED" = ",all," ] || [[ "$WANTED" == *",$NAME,"* ]] || continue
   $PY -m spidory.train --name ${NAME}_warm_s$SEED $TRAIN $COMMON || fail "$NAME training failed"
   $PY -m spidory.rounds --name ${NAME}_s$SEED --warm ${NAME}_warm_s$SEED $ROUNDS $R || fail "$NAME rounds failed"
-  $PY -m spidory.evaluate --single ${NAME}_s$SEED --out runs/results_${NAME}.json > runs/results_${NAME}.txt 2>&1 \
+  $PY -m spidory.evaluate --single ${NAME}_s$SEED --out runs/results_${NAME}_s$SEED.json > runs/results_${NAME}_s$SEED.txt 2>&1 \
     || fail "$NAME evaluation failed"
 done
-touch runs/DONE
+[ -n "${NO_DONE:-}" ] || touch runs/DONE  # run_jobs.sh marks the end itself

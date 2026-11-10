@@ -210,6 +210,9 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=ModelConfig.seq_len)
     parser.add_argument("--d-model", type=int, default=ModelConfig.d_model)
     parser.add_argument("--expert-dim", type=int, default=ModelConfig.expert_dim)
+    parser.add_argument("--n-core", type=int, default=ModelConfig.n_core, help="layers in the centre block")
+    parser.add_argument("--max-runs", type=int, default=ModelConfig.max_runs,
+                        help="most centre runs; 1 trains a model without loops")
     parser.add_argument("--arch", choices=["ngpt", "prenorm"], default=ModelConfig.arch)
     parser.add_argument("--active-experts", type=int, default=ModelConfig.active_experts)
     parser.add_argument("--between-layers", type=int, default=ModelConfig.between_layers)
@@ -253,7 +256,9 @@ def main() -> None:
                                     between_mode=args.between_mode, between_merge=args.between_merge,
                                     boundary_norm=not args.no_boundary_norm,
                                     route_per_loop=args.route_per_loop, run_signal=args.run_signal,
-                                    route_per_token=args.route_per_token)).to(device)
+                                    route_per_token=args.route_per_token, n_core=args.n_core,
+                                    max_runs=args.max_runs,
+                                    target_mean=min(ModelConfig.target_mean, args.max_runs))).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     compile_for_speed(model)
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)

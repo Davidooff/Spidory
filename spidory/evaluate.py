@@ -85,10 +85,13 @@ def decisions(model, corpus: Corpus, windows: int, mean_runs: float | None = Non
     return result
 
 
+BATCH = 64  # exam items generated together; only items with prompts of one length share a batch
+
+
 @torch.no_grad()
 def maths_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """Exact-answer rate with greedy generation on the real inference path."""
-    return sum(answer_item("maths", model, tok, item, **choice)[1] for item in exam[:questions]) / questions
+    return sum(ok for _, ok in answer_items("maths", model, tok, exam[:questions], **choice)) / questions
 
 
 def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> dict:
@@ -104,28 +107,62 @@ def accuracy_by_level(model, tok: Tokenizer, exam: list[dict], questions: int, *
 
 
 @torch.no_grad()
-def generate_text(model, tok: Tokenizer, prompt: str, longest: int, done=None, **choice) -> str:
-    """Greedy continuation, until end of document, `longest` tokens, or done(text) is true."""
+def generate_batch(model, tok: Tokenizer, prompts: list[str], longest: int, done=None,
+                   batch: int = BATCH, **choice) -> list[tuple[str, bool]]:
+    """Greedy continuations, each until end of document, `longest` tokens, or done(i, text).
+
+    Returns (text, stopped by done) per prompt. Prompts of the same token length run as one
+    batch: they gain one token per step, so every row stays exactly as long as it would alone,
+    with the same window, the same first tokens for routing and the same noise. No padding is
+    needed, so each row computes what a batch of one computes, up to rounding in the matrix
+    products.
+    """
     device = next(model.parameters()).device
     eod = tok.token_to_id("[EOD]")
-    ids = tok.encode(prompt).ids
-    start, text = len(ids), ""
-    for _ in range(longest):
-        window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
-        next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
-        if next_id == eod:
-            break
-        ids.append(next_id)
-        text = tok.decode(ids[start:])
-        if done is not None and done(text):
-            break
-    return text
+    encoded = [tok.encode(p).ids for p in prompts]
+    found: list[tuple[str, bool]] = [("", False)] * len(prompts)
+    by_length: dict[int, list[int]] = {}
+    for i, ids in enumerate(encoded):
+        by_length.setdefault(len(ids), []).append(i)
+    for indices in by_length.values():
+        for begin in range(0, len(indices), batch):
+            live = indices[begin:begin + batch]
+            ids = {i: list(encoded[i]) for i in live}
+            start = len(encoded[live[0]])
+            texts = {i: "" for i in live}
+            for _ in range(longest):
+                if not live:
+                    break
+                window = torch.tensor([ids[i][-model.cfg.seq_len:] for i in live], device=device)
+                next_ids = model.infer(window, **choice)[0][:, -1].argmax(-1).tolist()
+                still = []
+                for i, next_id in zip(live, next_ids):
+                    if next_id == eod:
+                        continue
+                    ids[i].append(next_id)
+                    texts[i] = tok.decode(ids[i][start:])
+                    if done is not None and done(i, texts[i]):
+                        found[i] = (texts[i], True)
+                        continue
+                    still.append(i)
+                live = still
+            for i, text in texts.items():
+                if not found[i][1]:
+                    found[i] = (text, False)
+    return found
+
+
+@torch.no_grad()
+def generate_text(model, tok: Tokenizer, prompt: str, longest: int, done=None, **choice) -> str:
+    """Greedy continuation of one prompt, until end of document, `longest` tokens, or done(text)."""
+    check = None if done is None else (lambda _, text: done(text))
+    return generate_batch(model, tok, [prompt], longest, check, **choice)[0][0]
 
 
 def compose_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """Share of "write a problem" tasks done as asked, checked by computing the reply."""
     items = exam[:questions]
-    return sum(answer_item("compose", model, tok, i, **choice)[1] for i in items) / max(1, len(items))
+    return sum(ok for _, ok in answer_items("compose", model, tok, items, **choice)) / max(1, len(items))
 
 
 def compose_done(item: dict):
@@ -142,14 +179,13 @@ def compose_done(item: dict):
 def word_problem_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, **choice) -> float:
     """GSM8K or SVAMP: the stated answer, or the last number written, must match."""
     items = exam[:questions]
-    return sum(answer_item("word", model, tok, i, **choice)[1] for i in items) / max(1, len(items))
+    return sum(ok for _, ok in answer_items("word", model, tok, items, **choice)) / max(1, len(items))
 
 
 def explain_accuracy(model, tok: Tokenizer, exam: list[dict], questions: int, longest: int = 220,
                      **choice) -> float:
     """Exact-answer rate when the model explains its steps first and ends with "The answer is N"."""
-    hits = sum(answer_item("explain", model, tok, item, longest=longest, **choice)[1]
-               for item in exam[:questions])
+    hits = sum(ok for _, ok in answer_items("explain", model, tok, exam[:questions], longest=longest, **choice))
     return hits / max(1, min(questions, len(exam)))
 
 
@@ -157,10 +193,20 @@ def _word_done(text: str) -> bool:
     return "answer is" in text.lower() and text.rstrip().endswith(".") or "\nQ:" in text
 
 
+def _explain_done(text: str) -> bool:
+    """A line break, or a finished sentence that states the answer."""
+    from .mixed_data import answer_of
+
+    return "\n" in text or (text.rstrip().endswith(".") and answer_of(text) is not None)
+
+
+LONGEST = {"maths": 16, "explain": 220, "compose": 180, "word": 300}
+
+
 @torch.no_grad()
-def answer_item(kind: str, model, tok: Tokenizer, item: dict, longest: int | None = None,
-                **choice) -> tuple[str, bool]:
-    """One exam item: the model's greedy reply and whether it is right.
+def answer_items(kind: str, model, tok: Tokenizer, items: list[dict], longest: int | None = None,
+                 **choice) -> list[tuple[str, bool]]:
+    """Exam items: the model's greedy reply to each and whether it is right.
 
     kind is "maths" (the first line must equal the answer, also used for the mixed-topic exam),
     "explain" (the sentence ending "the answer is N"), "compose" (the reply must do what was
@@ -169,39 +215,43 @@ def answer_item(kind: str, model, tok: Tokenizer, item: dict, longest: int | Non
     """
     from .mixed_data import answer_of, grade_compose, last_number
 
-    if kind == "compose":
-        text = generate_text(model, tok, item["prompt"], longest or 180, compose_done(item), **choice)
-        return text, grade_compose(item, text)
-    if kind == "word":
-        text = generate_text(model, tok, item["prompt"], longest or 300, _word_done, **choice).split("\nQ:")[0]
-        found = last_number(text)
-        try:
-            return text, found is not None and float(found) == float(item["answer"])
-        except ValueError:
-            return text, False
-    device = next(model.parameters()).device
-    eod = tok.token_to_id("[EOD]")
-    prompt = tok.encode(item["prompt"]).ids
-    ids, text, found = list(prompt), "", None
-    for _ in range(longest or (16 if kind == "maths" else 220)):
-        window = torch.tensor([ids[-model.cfg.seq_len:]], device=device)
-        next_id = int(model.infer(window, **choice)[0][0, -1].argmax())
-        if next_id == eod:
-            break
-        ids.append(next_id)
-        text = tok.decode(ids[len(prompt):])
-        if kind == "maths":
-            if "\n" in text:
-                break
-        elif "\n" in text or text.rstrip().endswith("."):
-            found = answer_of(text)
-            if found is not None or "\n" in text:
-                break
+    if kind not in LONGEST:
+        raise ValueError(f"unknown exam kind {kind!r}")
     if kind == "maths":
-        return text, text.split("\n")[0].strip() == item["answer"]
-    if kind == "explain":
-        return text, found == item["answer"]
-    raise ValueError(f"unknown exam kind {kind!r}")
+        done = lambda i, text: "\n" in text
+    elif kind == "explain":
+        done = lambda i, text: _explain_done(text)
+    elif kind == "compose":
+        checks = [compose_done(item) for item in items]
+        done = lambda i, text: checks[i](text)
+    else:
+        done = lambda i, text: _word_done(text)
+    replies = generate_batch(model, tok, [item["prompt"] for item in items], longest or LONGEST[kind],
+                             done, **choice)
+    found = []
+    for item, (text, stopped) in zip(items, replies):
+        if kind == "maths":
+            ok = text.split("\n")[0].strip() == item["answer"]
+        elif kind == "explain":
+            # As before: the answer counts only where the reply stopped by stating it.
+            ok = stopped and answer_of(text) == item["answer"]
+        elif kind == "compose":
+            ok = grade_compose(item, text)
+        else:
+            text = text.split("\nQ:")[0]
+            number = last_number(text)
+            try:
+                ok = number is not None and float(number) == float(item["answer"])
+            except ValueError:
+                ok = False
+        found.append((text, bool(ok)))
+    return found
+
+
+def answer_item(kind: str, model, tok: Tokenizer, item: dict, longest: int | None = None,
+                **choice) -> tuple[str, bool]:
+    """One exam item; see answer_items."""
+    return answer_items(kind, model, tok, [item], longest, **choice)[0]
 
 
 @torch.no_grad()
@@ -303,8 +353,9 @@ def evaluate(run: str, corpus_root: str, windows: int, questions: int, device: t
     cost = tflops_by_k(model.cfg)
     result["cycle"] = cycle_loss(model, corpus, windows)
     for k in K_GRID:
-        result["by_k"][str(k)] = score(k=k) | {"tflops_per_token": cost[k]}
-    for mean in MEAN_GRID:
+        if k <= model.cfg.max_runs:  # a model without loops is scored at one run only
+            result["by_k"][str(k)] = score(k=k) | {"tflops_per_token": cost[k]}
+    for mean in MEAN_GRID if model.cfg.max_runs >= max(MEAN_GRID) else ():
         chosen = decisions(model, corpus, windows, mean)
         result["by_mean"][str(mean)] = score(mean_runs=mean) | chosen | {
             "tflops_per_token": average_tflops(cost, chosen["run_counts"])}
@@ -492,9 +543,10 @@ def table(results: list[dict]) -> str:
     lines = [" | ".join(head), " | ".join("---" for _ in head)]
     for r in results:
         cells = [r["run"], f"{r['params']:,}"]
-        cells += [f"{r['by_k'][k]['mean_loss']:.3f}" for k in "1234"]
-        cells += [f"{r['by_mean'][str(m)]['mean_loss']:.3f}" for m in MEAN_GRID]
-        cells += [f"{r['by_k']['3']['maths_accuracy']:.3f}", f"{r['by_mean']['3.0']['maths_accuracy']:.3f}"]
+        get = lambda table, key, field: f"{table[key][field]:.3f}" if key in table else "—"
+        cells += [get(r["by_k"], k, "mean_loss") for k in "1234"]
+        cells += [get(r["by_mean"], str(m), "mean_loss") for m in MEAN_GRID]
+        cells += [get(r["by_k"], "3", "maths_accuracy"), get(r["by_mean"], "3.0", "maths_accuracy")]
         lines.append(" | ".join(cells))
     return "\n".join(lines)
 
