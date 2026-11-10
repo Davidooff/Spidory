@@ -30,11 +30,14 @@ for JOB in "$@"; do
       if [ ! -f "runs/$RUN/last.pt" ]; then
         false
       else
-        $PY -m spidory.evaluate --single "$RUN" --out "runs/rescore_$RUN.json" > "runs/rescore_$RUN.txt" 2>&1
+        # The uploaded checkpoint is a copy of one on the laptop: removed once scored, so it is
+        # not copied back.
+        $PY -m spidory.evaluate --single "$RUN" --out "runs/rescore_$RUN.json" > "runs/rescore_$RUN.txt" 2>&1 \
+          && rm -rf "runs/$RUN"
       fi ;;
     *)
       rm -f runs/JOB_FAILED
-      NO_DONE=1 STOP_FILE=JOB_FAILED scripts/run_mixed.sh "${JOB#*@}" "${JOB%@*}" ;;
+      NO_DONE=1 DROP_STEPS=1 STOP_FILE=JOB_FAILED scripts/run_mixed.sh "${JOB#*@}" "${JOB%@*}" ;;
   esac
   if [ $? -eq 0 ]; then
     echo "$(date -u +%FT%TZ) done $JOB"

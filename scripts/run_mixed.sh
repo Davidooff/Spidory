@@ -38,6 +38,9 @@ for ENTRY in "${VERSIONS[@]}"; do
   matched=1
   $PY -m spidory.train --name ${NAME}_warm_s$SEED $TRAIN $COMMON || fail "$NAME training failed"
   $PY -m spidory.rounds --name ${NAME}_s$SEED --warm ${NAME}_warm_s$SEED $ROUNDS $R || fail "$NAME rounds failed"
+  # The laptop disk is short (user's choice, 2026-11-10): the snapshots at steps 20000 and 40000
+  # are not kept. The end of warm-up and the final model stay.
+  [ -z "${DROP_STEPS:-}" ] || rm -f runs/${NAME}_warm_s$SEED/step_*.pt
   $PY -m spidory.evaluate --single ${NAME}_s$SEED --out runs/results_${NAME}_s$SEED.json > runs/results_${NAME}_s$SEED.txt 2>&1 \
     || fail "$NAME evaluation failed"
 done

@@ -225,6 +225,7 @@ def test_a_training_failure_never_writes_stopped_before_the_end(tmp_path):
     (tmp_path / "scripts").mkdir()
     for name in ("run_jobs.sh", "run_mixed.sh"):
         (tmp_path / "scripts" / name).write_text((SCRIPTS / name).read_text())
+        (tmp_path / "scripts" / name).chmod(0o755)
     (tmp_path / "runs").mkdir()
     fake = tmp_path / "py"
     # Fails the first training and checks that no STOPPED file exists while later jobs run.
@@ -237,6 +238,7 @@ def test_a_training_failure_never_writes_stopped_before_the_end(tmp_path):
     assert not (tmp_path / "stopped_seen").exists()
     assert "noloop@0" in (tmp_path / "runs" / "FAILED_JOBS").read_text()
     assert "plain_s2" in (tmp_path / "calls.log").read_text()
+    assert "noloop@0 noloop training failed" in (tmp_path / "runs" / "FAILED_JOBS").read_text()
 
 
 @pytest.mark.parametrize("job", ["plian@2", "@2", "plain@", "plain@x", "token_sigal_once@1", "nothing"])
@@ -259,3 +261,21 @@ def test_run_mixed_fails_when_no_version_matches(tmp_path):
     result = subprocess.run(["bash", "scripts/run_mixed.sh", "0", "nope"], cwd=tmp_path,
                             env=os.environ | {"PY": "true"}, capture_output=True)
     assert result.returncode == 1 and "nope" in (tmp_path / "runs" / "STOPPED").read_text()
+
+
+def test_snapshots_go_and_scored_copies_go_but_results_stay(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    for name in ("run_jobs.sh", "run_mixed.sh"):
+        (tmp_path / "scripts" / name).write_text((SCRIPTS / name).read_text())
+        (tmp_path / "scripts" / name).chmod(0o755)
+    runs = tmp_path / "runs"
+    for path in ("noloop_warm_s0/step_20000.pt", "noloop_warm_s0/last.pt", "old_s0/last.pt"):
+        (runs / path).parent.mkdir(parents=True, exist_ok=True)
+        (runs / path).write_text("x")
+    fake = tmp_path / "py"
+    fake.write_text('#!/usr/bin/env bash\nexit 0\n')
+    fake.chmod(0o755)
+    subprocess.run(["bash", "scripts/run_jobs.sh", "score@old_s0", "noloop@0"], cwd=tmp_path,
+                   env=os.environ | {"PY": str(fake)}, capture_output=True)
+    assert (runs / "DONE").exists() and not (runs / "old_s0").exists()
+    assert (runs / "noloop_warm_s0" / "last.pt").exists() and not (runs / "noloop_warm_s0" / "step_20000.pt").exists()
