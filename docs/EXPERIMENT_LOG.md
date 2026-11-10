@@ -422,8 +422,27 @@ almost never form a group (1-2 of 14) and their targets stay at 2.5.
     2.5 hours on a dead connection. The files were restored from Hugging Face and every checkpoint
     loaded.
 
+### v4 seed 1 (branch `v4-seed1`)
+68. **Seed 1 rounds reused seed 0's randomness** in 6 of every 7 rounds (`round_seed` was
+    `seed + 1000 * (number + 1) + index`). Now `seed * 100_003 + ...`; seed 0 is unchanged.
+69. **The rental-end Hub fallback could destroy a live machine** after a failed copy. It now only
+    restores from the Hub, and only once the machine is no longer listed.
+70. **Turkey upload ran at about 35 KB/s,** over the Vast proxy and directly. Destroyed after
+    1.5 hours ($0.98) without training.
+71. **Quebec's data build died** in `grow_v4`'s code step with a Rust "memory allocation of
+    274877906976 bytes failed". That machine had an older image (torch 2.11, CUDA 12.8). The
+    end-of-rental script copied the logs and destroyed it ($0.19). Later machines use the CUDA 13
+    image and the exact package versions of a working machine; the step then passed.
+72. **Estonia was overloaded by other tenants** (load 79 on 64 cores): the test suite ran for 4.5
+    hours before it was noticed ($2.38). Machines are now checked for load and CPU speed before
+    upload.
+73. **Seed-to-seed spread is as large as the model differences.** Maths accuracy moves 6-20 points
+    between seeds of one model, almost all in levels 6-7. The v4 single-seed maths conclusions
+    (run signal +12-16 points) did not hold on seed 1.
+
 Still open, from the review:
-- Single seeds so far.
+- Two seeds at most; maths accuracy needs 3-5 seeds per model.
+- Evaluation generates one item at a time: 2-3 hours of a nearly idle GPU per machine.
 - No compute-matched model without loops.
 - Between-block versions not matched in parameters or compute.
 - The penalty may hold every expert's average near 2.5.
@@ -435,7 +454,9 @@ Still open, from the review:
 - **v3 cycle and between block:** about $39 across 3 RTX 4090s, including the two stopped
   starts.
 - **v4 cycle:** $22.12 (credit $44.97 → $22.85), including the stopped leaked start.
-- **Project total:** about $67.
+- **v4 seed 1:** $20.08 across 7 rentals: $16.53 for the four that trained and $3.55 for the
+  three that failed (items 70-72).
+- **Project total:** about $87.
 - **Budget:** the original $10 limit was removed by the user on 2026-11-07.
 
 ## 10. Where things are
@@ -445,6 +466,9 @@ Still open, from the review:
   - `runs/remote`, `runs/remote_big`, `runs/remote_100m`, `runs/remote_v3`
   - v3: `runs/remote_v3_s0`, `runs/remote_v3_s1`, `runs/remote_between`
   - v4: `runs/remote_mixed_plain`, `runs/remote_mixed_perloop_between`, `runs/remote_mixed_token`
+  - v4 seed 1 and per-token once: `runs/remote_r5_plain_s1`, `runs/remote_r5_token_signal_s1`,
+    `runs/remote_r5_perloop_s1`, `runs/remote_r5_once_s0`; logs of the failed Quebec start in
+    `runs/failed_quebec_r5_perloop_s1`
   - a backup of every run is on Hugging Face (`Davidow/spidory-runs`, private)
 - **Branch `run-signal-per-token`:** v4 code, data v6 and `scripts/run_mixed.sh`.
 - **Report:** https://claude.ai/artifact/DrpnN2ih7TmFuriKtiUvUi

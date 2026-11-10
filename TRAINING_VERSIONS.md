@@ -81,3 +81,22 @@ splits that training never saw.
   5.4%, but its experts don't follow topics. The neuron didn't beat the best fixed count, and the
   between block was worse again. GSM8K stayed at 0-4%.
 
+## v4 seed 1 and per-token experts chosen once (branch `v4-seed1`)
+- **Runs:** Plain, Plain + run signal, per-token + run signal and per-loop routing again on
+  seed 1. New on seed 0: per-token + run signal with each token's expert chosen once and kept in
+  every run (`token_signal_once`). Same data and exams as seed 0.
+- **Result (k = 3, loss / maths):**
+
+  | Model | Seed 0 | Seed 1 |
+  |---|---|---|
+  | Plain | 1.706 / 61.2% | 1.702 / 67.2% |
+  | Plain + run signal | 1.698 / 73.6% | 1.715 / 62.0% |
+  | Per-token + run signal | 1.696 / 82.4% | 1.717 / 65.0% |
+  | Per-loop routing | 1.808 / 56.6% | 1.748 / 77.0% |
+  | Per-token, chosen once | 1.698 / 69.4% | — |
+
+- **Reading:** the run signal's maths gain didn't repeat. Maths accuracy swings 6-20 points
+  between seeds, almost all in levels 6-7, so one seed only says whether a model found a way to
+  solve them. Per-loop routing is still worst by loss on both seeds. Choosing the expert once
+  vs every run is undecided on one seed. The neuron again didn't beat the best fixed count.
+
