@@ -176,6 +176,18 @@ def test_train_cli_builds_the_deep_model(tmp_path, monkeypatch):
         train.main()
     cfg = seen["cfg"]
     assert (cfg.n_core, cfg.max_runs, cfg.target_mean, cfg.use_experts) == (30, 1, 1.0, False)
+    assert isinstance(cfg.target_mean, float)
+    # The rounds stage picks run counts from the targets: this crashed with an integer target.
+    model = Spidory(replace(cfg, vocab_size=64, d_model=32, seq_len=16, n_heads=4, n_input=1, n_core=2,
+                            n_output=1))
+    assert model.run_targets.dtype == torch.float32
+    assert sample_ks(10_000, TCFG, model, torch.zeros(4, dtype=torch.long)).max() == 1
+
+
+def test_integer_targets_still_give_float_buffers():
+    model = Spidory(replace(CFG, use_experts=False, max_runs=2, target_mean=2))
+    assert model.run_targets.dtype == torch.float32
+    assert sample_ks(10_000, TCFG, model, torch.zeros(4, dtype=torch.long)).max() <= 2
 
 
 def test_score_table_handles_models_without_loops():

@@ -149,7 +149,7 @@ class Spidory(nn.Module):
             raise ValueError("route_per_token needs experts")
         if cfg.route_per_token and cfg.neuron_train == "mix":
             raise ValueError("the mix neuron mixes whole-sequence states; use sampled or average per token")
-        self.register_buffer("run_targets", torch.full((groups,), cfg.target_mean))
+        self.register_buffer("run_targets", torch.full((groups,), float(cfg.target_mean)))
         self.register_buffer("expert_usage", torch.full((groups,), 1.0 / groups))
         self.register_buffer("run_head_ready", torch.tensor(False))
         self.normalize_weights()

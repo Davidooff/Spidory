@@ -258,7 +258,7 @@ def main() -> None:
                                     route_per_loop=args.route_per_loop, run_signal=args.run_signal,
                                     route_per_token=args.route_per_token, n_core=args.n_core,
                                     max_runs=args.max_runs,
-                                    target_mean=min(ModelConfig.target_mean, args.max_runs))).to(device)
+                                    target_mean=float(min(ModelConfig.target_mean, args.max_runs)))).to(device)
         optimizer, start = make_optimizer(model, cfg), 0
     compile_for_speed(model)
     print(f"{args.name}: {model.num_params():,} params on {device}, step {start} of {stop}", flush=True)
