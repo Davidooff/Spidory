@@ -188,13 +188,13 @@ def test_score_table_handles_models_without_loops():
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 
 
-def _jobs(tmp_path, *jobs):
+def _jobs(tmp_path, *jobs, exists_ok=False):
     """Runs run_jobs.sh in a copy of the scripts folder with a fake Python that logs its calls."""
     (tmp_path / "scripts").mkdir()
     for name in ("run_jobs.sh", "run_mixed.sh"):
         (tmp_path / "scripts" / name).write_text((SCRIPTS / name).read_text())
         (tmp_path / "scripts" / name).chmod(0o755)
-    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs").mkdir(exist_ok=exists_ok)
     fake = tmp_path / "py"
     fake.write_text('#!/usr/bin/env bash\necho "$@" >> calls.log\n')
     fake.chmod(0o755)
@@ -214,7 +214,48 @@ def test_jobs_run_in_order_and_mark_the_end_once(tmp_path):
     assert any("--out runs/results_token_s1.json" in c for c in calls)
 
 
-def test_score_job_needs_the_checkpoint(tmp_path):
-    code, calls, runs = _jobs(tmp_path, "score@plain_s0")
-    assert code == 1 and "missing runs/plain_s0/last.pt" in (runs / "STOPPED").read_text()
-    assert not (runs / "DONE").exists() and calls == []
+def test_a_failed_job_is_recorded_and_the_next_job_still_runs(tmp_path):
+    code, calls, runs = _jobs(tmp_path, "score@plain_s0", "noloop@1")
+    assert code == 0 and not (runs / "DONE").exists()
+    assert "score@plain_s0" in (runs / "STOPPED").read_text() and "score@plain_s0" in (runs / "FAILED_JOBS").read_text()
+    assert [c.split("--name ")[1].split()[0] for c in calls if "--name" in c] == ["noloop_warm_s1", "noloop_s1"]
+
+
+def test_a_training_failure_never_writes_stopped_before_the_end(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    for name in ("run_jobs.sh", "run_mixed.sh"):
+        (tmp_path / "scripts" / name).write_text((SCRIPTS / name).read_text())
+    (tmp_path / "runs").mkdir()
+    fake = tmp_path / "py"
+    # Fails the first training and checks that no STOPPED file exists while later jobs run.
+    fake.write_text('#!/usr/bin/env bash\necho "$@" >> calls.log\n'
+                    '[ -f runs/STOPPED ] && echo seen >> stopped_seen\n'
+                    '[[ "$*" == *noloop_warm_s0* ]] && exit 1\nexit 0\n')
+    fake.chmod(0o755)
+    subprocess.run(["bash", "scripts/run_jobs.sh", "noloop@0", "plain@2"], cwd=tmp_path,
+                   env=os.environ | {"PY": str(fake)}, capture_output=True)
+    assert not (tmp_path / "stopped_seen").exists()
+    assert "noloop@0" in (tmp_path / "runs" / "FAILED_JOBS").read_text()
+    assert "plain_s2" in (tmp_path / "calls.log").read_text()
+
+
+@pytest.mark.parametrize("job", ["plian@2", "@2", "plain@", "plain@x", "token_sigal_once@1", "nothing"])
+def test_bad_jobs_are_refused_before_anything_runs(tmp_path, job):
+    code, calls, runs = _jobs(tmp_path, "noloop@0", job)
+    assert code == 1 and calls == [] and (runs / "STOPPED").exists() and not (runs / "DONE").exists()
+
+
+def test_no_job_starts_after_the_time_limit(tmp_path):
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "LIMIT_REACHED").touch()
+    code, calls, runs = _jobs(tmp_path, "noloop@0", exists_ok=True)
+    assert code == 1 and calls == [] and not (runs / "DONE").exists()
+
+
+def test_run_mixed_fails_when_no_version_matches(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run_mixed.sh").write_text((SCRIPTS / "run_mixed.sh").read_text())
+    (tmp_path / "runs").mkdir()
+    result = subprocess.run(["bash", "scripts/run_mixed.sh", "0", "nope"], cwd=tmp_path,
+                            env=os.environ | {"PY": "true"}, capture_output=True)
+    assert result.returncode == 1 and "nope" in (tmp_path / "runs" / "STOPPED").read_text()

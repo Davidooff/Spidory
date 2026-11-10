@@ -14,6 +14,8 @@ if [ ! -f data/MIXED_DONE ]; then
   $PY -m spidory.mixed_data --root data --templates templates > runs/mixed_data.log 2>&1 || stop "mixed data failed"
   cp data/mixed_stats.json data/MIXED_DONE
 fi
+# A fingerprint of the built data, so machines and seeds can be checked to share it.
+(cd data && sha256sum *exam*.json *stats*.json *.test.bin *.val.bin) > runs/data_sha.txt 2>/dev/null
 if [ "${1:-}" = jobs ]; then
   shift; scripts/run_jobs.sh "$@" > runs/run_jobs.log 2>&1
 else

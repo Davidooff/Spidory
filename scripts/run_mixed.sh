@@ -14,7 +14,8 @@ TOTAL=$((S1 + S2 + CYCLE + ROUND * 7 * PASSES))
 COMMON="--stage1 $S1 --stage2 $S2 --cycle $CYCLE --total $TOTAL --batch-size $BATCH --seed $SEED --arch ngpt --lr 6e-3 --warmup 1000"
 R="--round-steps $ROUND --passes $PASSES --seed $SEED"
 NEURON="--run-mode joint --neuron net --neuron-train sampled"
-fail() { echo "$1" > runs/STOPPED; exit 1; }
+# Under run_jobs.sh a failure goes to another file: STOPPED would end the rental at once.
+fail() { echo "$1" > "runs/${STOP_FILE:-STOPPED}"; exit 1; }
 
 # name : training flags : rounds flags
 VERSIONS=(
@@ -30,12 +31,15 @@ VERSIONS=(
   "noloop_deep:--plain --max-runs 1 --n-core 30:--control-only"  # no loop, compute of Plain at k = 3
 )
 WANTED=",${2:-all},"
+matched=0
 for ENTRY in "${VERSIONS[@]}"; do
   NAME=${ENTRY%%:*}; REST=${ENTRY#*:}; TRAIN=${REST%%:*}; ROUNDS=${REST#*:}
   [ "$WANTED" = ",all," ] || [[ "$WANTED" == *",$NAME,"* ]] || continue
+  matched=1
   $PY -m spidory.train --name ${NAME}_warm_s$SEED $TRAIN $COMMON || fail "$NAME training failed"
   $PY -m spidory.rounds --name ${NAME}_s$SEED --warm ${NAME}_warm_s$SEED $ROUNDS $R || fail "$NAME rounds failed"
   $PY -m spidory.evaluate --single ${NAME}_s$SEED --out runs/results_${NAME}_s$SEED.json > runs/results_${NAME}_s$SEED.txt 2>&1 \
     || fail "$NAME evaluation failed"
 done
+[ $matched -eq 1 ] || fail "no version matches $2"
 [ -n "${NO_DONE:-}" ] || touch runs/DONE  # run_jobs.sh marks the end itself
