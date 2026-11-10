@@ -9,34 +9,40 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=. OMP_NUM_THREADS=4 SPIDORY_DATASETS=story,maths,qa,mixed,explain,compose,wordmath
 PY=${PY:-/venv/main/bin/python}
+CHECK=0
+[ "${1:-}" = --check ] && { CHECK=1; shift; }  # check the job list only, before the data build
 [ $# -gt 0 ] || { echo "no jobs given" > runs/STOPPED; exit 1; }
 for JOB in "$@"; do
   case "$JOB" in
-    score@?*) ;;
+    score@*)
+      [[ "${JOB#score@}" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad run in job $JOB" > runs/STOPPED; exit 1; } ;;
     ?*@*)
       NAME=${JOB%@*}; SEED=${JOB#*@}
       [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "bad seed in job $JOB" > runs/STOPPED; exit 1; }
-      grep -q "^  \"$NAME:" scripts/run_mixed.sh || { echo "unknown version in job $JOB" > runs/STOPPED; exit 1; } ;;
+      grep -qF -- "  \"$NAME:" scripts/run_mixed.sh || { echo "unknown version in job $JOB" > runs/STOPPED; exit 1; } ;;
     *) echo "bad job $JOB" > runs/STOPPED; exit 1 ;;
   esac
 done
+[ $CHECK -eq 1 ] && exit 0
 failed=0
 for JOB in "$@"; do
   [ -f runs/LIMIT_REACHED ] && { echo "$(date -u +%FT%TZ) time limit, not starting $JOB"; exit 1; }
   echo "$(date -u +%FT%TZ) start $JOB"
+  rm -f runs/JOB_FAILED
   case "$JOB" in
     score@*)
       RUN=${JOB#score@}
       if [ ! -f "runs/$RUN/last.pt" ]; then
-        false
+        echo "missing runs/$RUN/last.pt" > runs/JOB_FAILED; false
       else
-        # The uploaded checkpoint is a copy of one on the laptop: removed once scored, so it is
-        # not copied back.
-        $PY -m spidory.evaluate --single "$RUN" --out "runs/rescore_$RUN.json" > "runs/rescore_$RUN.txt" 2>&1 \
-          && rm -rf "runs/$RUN"
+        $PY -m spidory.evaluate --single "$RUN" --out "runs/rescore_$RUN.json" > "runs/rescore_$RUN.txt" 2>&1
+        code=$?
+        # A checkpoint uploaded from the laptop (marked UPLOADED) is a copy: removed once scored,
+        # so it is not copied back. A run trained here is never removed.
+        [ $code -eq 0 ] && [ -f "runs/$RUN/UPLOADED" ] && rm -rf "runs/$RUN"
+        [ $code -eq 0 ]
       fi ;;
     *)
-      rm -f runs/JOB_FAILED
       NO_DONE=1 DROP_STEPS=1 STOP_FILE=JOB_FAILED scripts/run_mixed.sh "${JOB#*@}" "${JOB%@*}" ;;
   esac
   if [ $? -eq 0 ]; then

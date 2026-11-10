@@ -253,7 +253,8 @@ def test_a_training_failure_never_writes_stopped_before_the_end(tmp_path):
     assert "noloop@0 noloop training failed" in (tmp_path / "runs" / "FAILED_JOBS").read_text()
 
 
-@pytest.mark.parametrize("job", ["plian@2", "@2", "plain@", "plain@x", "token_sigal_once@1", "nothing"])
+@pytest.mark.parametrize("job", ["plian@2", "@2", "plain@", "plain@x", "token_sigal_once@1", "nothing", "p.ain@0",
+                                 ".*@1", "score@../x", "score@a/b", "score@"])
 def test_bad_jobs_are_refused_before_anything_runs(tmp_path, job):
     code, calls, runs = _jobs(tmp_path, "noloop@0", job)
     assert code == 1 and calls == [] and (runs / "STOPPED").exists() and not (runs / "DONE").exists()
@@ -281,13 +282,22 @@ def test_snapshots_go_and_scored_copies_go_but_results_stay(tmp_path):
         (tmp_path / "scripts" / name).write_text((SCRIPTS / name).read_text())
         (tmp_path / "scripts" / name).chmod(0o755)
     runs = tmp_path / "runs"
-    for path in ("noloop_warm_s0/step_20000.pt", "noloop_warm_s0/last.pt", "old_s0/last.pt"):
+    for path in ("noloop_warm_s0/step_20000.pt", "noloop_warm_s0/last.pt", "old_s0/last.pt", "old_s0/UPLOADED",
+                 "here_s0/last.pt"):
         (runs / path).parent.mkdir(parents=True, exist_ok=True)
         (runs / path).write_text("x")
     fake = tmp_path / "py"
     fake.write_text('#!/usr/bin/env bash\nexit 0\n')
     fake.chmod(0o755)
-    subprocess.run(["bash", "scripts/run_jobs.sh", "score@old_s0", "noloop@0"], cwd=tmp_path,
+    subprocess.run(["bash", "scripts/run_jobs.sh", "score@old_s0", "score@here_s0", "noloop@0"], cwd=tmp_path,
                    env=os.environ | {"PY": str(fake)}, capture_output=True)
     assert (runs / "DONE").exists() and not (runs / "old_s0").exists()
+    assert (runs / "here_s0" / "last.pt").exists()  # trained on this machine: never removed
     assert (runs / "noloop_warm_s0" / "last.pt").exists() and not (runs / "noloop_warm_s0" / "step_20000.pt").exists()
+
+
+def test_check_mode_only_checks(tmp_path):
+    code, calls, runs = _jobs(tmp_path, "--check", "noloop@0", "score@plain_s0")
+    assert code == 0 and calls == [] and not (runs / "DONE").exists() and not (runs / "STOPPED").exists()
+    code, calls, runs = _jobs(tmp_path / "b", "--check", "noloop@0", "plian@1") if (tmp_path / "b").mkdir() is None else None
+    assert code == 1 and (runs / "STOPPED").exists()

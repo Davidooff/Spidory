@@ -8,6 +8,10 @@ export PYTHONPATH=. OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=true
 PY=${PY:-/venv/main/bin/python}
 mkdir -p runs
 stop() { echo "$1" > runs/STOPPED; exit 1; }
+# A job list is checked before the long data build, so a typo costs nothing.
+if [ "${1:-}" = jobs ]; then
+  shift; scripts/run_jobs.sh --check "$@" || exit 1; set -- jobs "$@"
+fi
 [ -f data/V4_DONE ] || $PY -m spidory.grow_v4 --root data > runs/grow_v4.log 2>&1 || stop "data growth failed"
 [ -f data/V5_DONE ] || $PY -m spidory.clean_v5 --root data > runs/clean_v5.log 2>&1 || stop "data cleaning failed"
 if [ ! -f data/MIXED_DONE ]; then
