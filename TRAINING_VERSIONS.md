@@ -100,3 +100,32 @@ splits that training never saw.
   solve them. Per-loop routing is still worst by loss on both seeds. Choosing the expert once
   vs every run is undecided on one seed. The neuron again didn't beat the best fixed count.
 
+
+## v4 on 3 seeds and models without loops (branch `v4-seeds`)
+- **Runs:** every v4 model on seeds 0, 1 and 2 (18 new trainings on 6 rented RTX 4090s), plus
+  two models without loops: `noloop` (Plain trained and scored at 1 run, same 26M parameters)
+  and `noloop_deep` (Plain with a 30-layer centre at 1 run, 54M parameters, the same compute per
+  token as Plain at `k = 3`). The 12 older runs were scored again with the new batched
+  evaluation, so all 30 numbers come from the same code.
+- **Result (mean of 3 seeds, `k = 3`, or `k = 1` for the models without loops):**
+
+  | Model | Loss | Maths | Compose | Mixed |
+  |---|---|---|---|---|
+  | No loops, 10 layers | 1.710 ±0.002 | 65.5% ±7.3 | 59.1% | 17.2% |
+  | No loops, 30 layers | **1.694** ±0.010 | 70.6% ±4.8 | 59.3% | 19.9% |
+  | Plain | 1.708 ±0.006 | 65.6% ±4.6 | 60.4% | 16.1% |
+  | Plain + run signal | 1.708 ±0.009 | 66.7% ±5.6 | 56.4% | 20.2% |
+  | Plain + run signal, no norm | 1.711 ±0.004 | 69.3% ±4.1 | 63.3% | 15.7% |
+  | Per-token | 1.716 ±0.005 | 69.9% ±4.0 | 60.0% | 13.9% |
+  | Per-token + run signal | 1.711 ±0.013 | 71.3% ±10.0 | 58.9% | 16.7% |
+  | Per-token + signal, chosen once | 1.711 ±0.012 | 59.7% ±8.4 | 57.6% | 16.7% |
+  | Per-loop routing | 1.768 ±0.035 | 66.6% ±10.6 | 58.9% | 13.6% |
+  | Between block + signal | 1.752 ±0.012 | 64.1% ±9.5 | 66.0% | 14.5% |
+
+- **Reading:** the loops don't beat a model trained for one pass. The 10-layer model without
+  loops equals Plain at 3 runs (1.710 vs 1.708, maths 65.5% vs 65.6%) at a third of the compute.
+  Plain's gain from its second run (1.739 → 1.708) only makes up for what training with a
+  sampled run count costs at 1 run. Spending the same compute on 30 different layers instead of
+  3 runs of 10 gives the best loss (1.694), with twice the parameters. The run signal, experts
+  and per-token routing are within seed noise of Plain. Per-loop routing and the between block
+  are worse by 0.04-0.06. The neuron again matches the best fixed count, at about 2.5 runs.

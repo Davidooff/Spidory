@@ -264,6 +264,15 @@ almost never form a group (1-2 of 14) and their targets stay at 2.5.
   batch instead of 1/3. GSM8K stays at 0-4% for every model.
 - **The between block lost again** (1.742 vs 1.698 for Plain + signal, with 34% more
   parameters).
+- **v4 on 3 seeds: the loops don't pay.** A Plain model trained and scored at 1 run
+  (`noloop`, same 26M parameters) reaches 1.710 ±0.002, the same as Plain at 3 runs
+  (1.708 ±0.006), at a third of the compute. Plain gains on its second run only because training
+  with a sampled run count makes its 1-run model worse (1.739). The same compute spent on a
+  30-layer centre at 1 run (`noloop_deep`, 54M parameters) gives the best loss of all, 1.694.
+- **v4 on 3 seeds: the single-seed gains were noise.** The run signal, experts and per-token
+  routing all land within 0.008 of Plain in loss, and maths moves ±4-10 points between seeds, more
+  than the gaps between models. Per-token experts chosen once score lowest in maths (59.7%).
+  Per-loop routing (1.768) and the between block (1.752) stay clearly worse.
 
 ## 7. Tests
 - **Test count:** grew from 20 to 109 on `main`, 211 on `arch-between` and 260 on
@@ -440,10 +449,29 @@ almost never form a group (1-2 of 14) and their targets stay at 2.5.
     between seeds of one model, almost all in levels 6-7. The v4 single-seed maths conclusions
     (run signal +12-16 points) did not hold on seed 1.
 
+### v4 on 3 seeds (branch `v4-seeds`)
+74. **`--max-runs 1` crashed the rounds:** `target_mean = min(2.5, max_runs)` was the integer 1,
+    which made a Long buffer, and `pick_k` failed at the first round. Found by a review agent on a
+    laptop test before any rental; targets are now always float.
+75. **The test suite timed out on Texas and Italy:** the hosts show 96-256 cores under a limit of
+    about 30, and unlimited threads made 316 tests take 10-20 minutes. Tests now run with
+    `OMP_NUM_THREADS=8`; both machines were set up again.
+76. **Re-scoring took longer than measured:** 26 minutes for Plain, but 45-77 minutes for models
+    with experts or the between block, since batched evaluation is still bound by the CPU (prompts
+    batch only with prompts of the same length, and stop checks run in Python per token). The cost
+    estimate of $36.5 was low and the credit was topped up twice during the cycle.
+77. **The 17-hour time limit would have cut the last runs** on Norway and Denmark: `noloop_deep`
+    takes 3.2 hours per seed and `noloop` runs rounds too. Both limits were moved to 10:00 UTC while
+    the machines ran; the old watchdog was stopped first, so only one limit was active.
+78. **Denmark's first copy back failed** after 30 minutes (4.1 GB). The end-of-rental script
+    retried, matched all 50 files and only then destroyed the machine.
+
 Still open, from the review:
-- Two seeds at most; maths accuracy needs 3-5 seeds per model.
-- Evaluation generates one item at a time: 2-3 hours of a nearly idle GPU per machine.
-- No compute-matched model without loops.
+- Maths accuracy still needs more seeds or a larger exam: ±4-10 points between seeds.
+- Batched evaluation is still CPU-bound (GPU at 15-25%): prompts of different lengths aren't
+  batched together.
+- `noloop_deep` matches Plain's compute per token at inference, not in training (Plain trains at
+  a sampled run count).
 - Between-block versions not matched in parameters or compute.
 - The penalty may hold every expert's average near 2.5.
 - QA held-out windows repeat each SQuAD paragraph about 5 times.
@@ -456,7 +484,9 @@ Still open, from the review:
 - **v4 cycle:** $22.12 (credit $44.97 → $22.85), including the stopped leaked start.
 - **v4 seed 1:** $20.08 across 7 rentals: $16.53 for the four that trained and $3.55 for the
   three that failed (items 70-72).
-- **Project total:** about $87.
+- **v4 on 3 seeds:** about $45.40 across 6 rentals (credit $37.64 + $25 top-up → $17.26), for
+  18 trainings and 12 re-scores, 7.5 to 19.5 hours per machine.
+- **Project total:** about $132.
 - **Budget:** the original $10 limit was removed by the user on 2026-11-07.
 
 ## 10. Where things are
@@ -469,8 +499,13 @@ Still open, from the review:
   - v4 seed 1 and per-token once: `runs/remote_r5_plain_s1`, `runs/remote_r5_token_signal_s1`,
     `runs/remote_r5_perloop_s1`, `runs/remote_r5_once_s0`; logs of the failed Quebec start in
     `runs/failed_quebec_r5_perloop_s1`
+  - v4 on 3 seeds and without loops: `runs/remote_r6_deep` (the 12 re-scored runs and
+    `noloop_deep`), `runs/remote_r6_plain`, `runs/remote_r6_between`, `runs/remote_r6_token`,
+    `runs/remote_r6_perloop`, `runs/remote_r6_signal`
   - a backup of every run is on Hugging Face (`Davidow/spidory-runs`, private)
 - **Branch `run-signal-per-token`:** v4 code, data v6 and `scripts/run_mixed.sh`.
+- **Branch `v4-seeds`:** batched evaluation, the models without loops (`--max-runs`, `--n-core`)
+  and the job runner `scripts/run_jobs.sh`.
 - **Report:** https://claude.ai/artifact/DrpnN2ih7TmFuriKtiUvUi
 - **Playground (branch `playground-v4`):** `python -m spidory.ui.server --root <project>` from the
   branch folder, then http://127.0.0.1:8765. It runs on the laptop CPU and has three modes:
