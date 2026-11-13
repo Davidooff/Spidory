@@ -9,6 +9,13 @@ same size.
 **Paper draft:** [`paper/expert_reselection.pdf`](paper/expert_reselection.pdf)
 (*Choose Again Each Loop: Expert Re-selection and the One-Loop Tax in a Small Looped Transformer*).
 
+**Weights:** the paper's 30 models (10 variants × 3 seeds) are on Hugging Face at
+[Davidow/spidory](https://huggingface.co/Davidow/spidory):
+```python
+from spidory.hub import load
+model, tok = load("token_signal_s0")
+```
+
 ## Main results (3 seeds, 1.2B tokens per model)
 - With per-token routing, choosing the expert again before each loop gives 71.3% multi-step
   arithmetic accuracy, against 59.7% when the expert is fixed after the first loop. Re-selection
@@ -25,9 +32,10 @@ same size.
 | `spidory/train.py`, `rounds.py`, `joint.py` | Training stages, rounds, learned loop controller |
 | `spidory/data*.py`, `grow_v4.py`, `clean_v5.py`, `mixed_data.py` | Data building and leak removal |
 | `spidory/evaluate.py` | Test loss, arithmetic and other exams |
+| `spidory/hub.py` | Export to safetensors and load the released weights |
 | `spidory/ui/` | Local playground: `python -m spidory.ui.server --root .`, then http://127.0.0.1:8765 |
 | `scripts/` | Run and rental scripts (`run_mixed.sh`, `run_jobs.sh`, `build_mixed_then_run.sh`) |
-| `tests/` | 316 tests |
+| `tests/` | 319 tests |
 | `docs/EXPERIMENT_LOG.md` | Full record: every model, result, problem and cost |
 | `TRAINING_VERSIONS.md` | One summary per model version |
 
@@ -39,6 +47,9 @@ pytest
 scripts/run_mixed.sh 0 plain,token_signal
 ```
 `scripts/run_mixed.sh` lists every model variant. Data and runs are not in the repository.
+
+## License
+Apache-2.0 ([`LICENSE`](LICENSE)), for the code and the released weights.
 
 ## Branches
 `main` holds the latest code (three seeds, models without loops). `arch-between`,

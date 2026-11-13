@@ -3,7 +3,7 @@ name = "spidory"
 version = "0.1.0"
 description = "Dory-style looped transformer with self-organising experts and learned run counts"
 requires-python = ">=3.12"
-dependencies = ["torch>=2.15", "datasets>=3.0", "tokenizers>=0.20", "numpy"]
+dependencies = ["torch>=2.15", "datasets>=3.0", "tokenizers>=0.20", "numpy", "safetensors", "huggingface_hub"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
